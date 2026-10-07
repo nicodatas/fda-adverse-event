@@ -32,14 +32,22 @@ jobs:
       - name: Install Databricks CLI
         uses: databricks/setup-cli@main
 
-      - name: Configure Databricks CLI
+      - name: Check secrets and configure CLI
+        id: secrets
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
-          echo "[DEFAULT]" > ~/.databrickscfg
-          echo "host = $DATABRICKS_HOST" >> ~/.databrickscfg
-          echo "token = $DATABRICKS_TOKEN" >> ~/.databrickscfg
+          if [ -z "$DATABRICKS_HOST" ] || [ -z "$DATABRICKS_TOKEN" ]; then
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::notice::DATABRICKS_HOST or DATABRICKS_TOKEN not set — skipping bundle validation"
+          else
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "[DEFAULT]" > ~/.databrickscfg
+            echo "host = $DATABRICKS_HOST" >> ~/.databrickscfg
+            echo "token = $DATABRICKS_TOKEN" >> ~/.databrickscfg
+          fi
 
       - name: Validate bundle
+        if: steps.secrets.outputs.available == 'true'
         run: databricks bundle validate

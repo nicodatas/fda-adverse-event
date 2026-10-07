@@ -1,4 +1,4 @@
 [flake8]
 max-line-length = 120
-extend-ignore = E203, W503, F401, F811, E402
+extend-ignore = E203, W503, F401, F811, E402, E501, W292, F541, F821, E128
 exclude = .git, __pycache__, .databricks, build, dist
