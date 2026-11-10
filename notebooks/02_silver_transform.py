@@ -11,15 +11,18 @@
 # MAGIC
 # MAGIC Drugs and reactions are extracted independently to avoid a drug×reaction Cartesian product.
 # MAGIC The `report_id` column links the three entities. No drug-to-reaction causal relationship is implied.
+# MAGIC Drug-role conflicts for the same normalized drug resolve deterministically: Suspect (1),
+# MAGIC then Concomitant (2), then Interacting (3).
 # MAGIC
-# MAGIC **Report versioning:** openFDA reports carry `safetyreportversion`. When the same report appears
-# MAGIC multiple times in bronze (repeated ingestion or follow-up versions), silver keeps only the highest
-# MAGIC version — and the MERGE update is guarded so an older version can never overwrite a newer one.
+# MAGIC **Report versioning:** openFDA reports carry `safetyreportversion`. Identical copies are expected in
+# MAGIC append-only Bronze, but conflicting payloads with the same report ID/version fail before writes.
+# MAGIC Silver keeps the highest version; only a strictly newer version may update an existing report.
 # MAGIC Child rows (drugs/reactions) are kept only from the latest version of each report, and the child
 # MAGIC MERGE deletes target rows that are no longer present in the source (child-table sync).
 # MAGIC
-# MAGIC **Assumption:** silver re-reads the COMPLETE bronze history on every run (bronze files are
-# MAGIC append-only). All version-collision and child-sync logic depends on that assumption.
+# MAGIC **Assumption and recovery:** silver re-reads the COMPLETE bronze history on every run (bronze files
+# MAGIC are append-only). Each Delta MERGE is atomic individually, not across all three tables. A task retry
+# MAGIC replays the full history to converge after a partial multi-table write.
 
 # COMMAND ----------
 
