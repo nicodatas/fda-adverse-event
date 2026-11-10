@@ -34,6 +34,7 @@ from pyspark.sql.functions import (
     count,
     countDistinct,
     explode,
+    explode_outer,
     lit,
     round,
     row_number,
@@ -43,6 +44,7 @@ from pyspark.sql.functions import (
     when,
 )
 from pyspark.sql.functions import max as _max
+from pyspark.sql.functions import min as _min
 from pyspark.sql.functions import sum as _sum
 from pyspark.sql.window import Window
 
@@ -65,6 +67,55 @@ def read_bronze_data(spark_session: SparkSession, path: str) -> DataFrame:
     logger.info(f"Reading raw JSON data from path: {path}")
     # multiline=true because openFDA returns pretty-printed JSON, not JSONL
     return spark_session.read.option("multiline", "true").json(path)
+
+
+def validate_raw_input(df: DataFrame) -> dict:
+    """Validate raw openFDA records before extraction can filter anything.
+
+    A report without safetyreportid is a hard failure because its children
+    cannot be related to a parent. Blank drug/reaction terms are soft anomalies:
+    they are counted and warned about before the extraction functions discard
+    them. This prevents post-extraction metrics from hiding rejected input.
+    """
+    reports = df.select(explode(col("results")).alias("result"))
+    null_report_ids = reports.agg(
+        _sum(when(col("result.safetyreportid").isNull(), 1).otherwise(0)).alias("n")
+    ).first()["n"] or 0
+
+    drug_rows = reports.select(
+        explode_outer(col("result.patient.drug")).alias("drug_info")
+    )
+    blank_drug_names = drug_rows.filter(
+        col("drug_info.medicinalproduct").isNull()
+        | (trim(col("drug_info.medicinalproduct")) == "")
+    ).count()
+
+    reaction_rows = reports.select(
+        explode_outer(col("result.patient.reaction")).alias("reaction_info")
+    )
+    blank_reaction_names = reaction_rows.filter(
+        col("reaction_info.reactionmeddrapt").isNull()
+        | (trim(col("reaction_info.reactionmeddrapt")) == "")
+    ).count()
+
+    metrics = {
+        "null_report_ids": null_report_ids,
+        "blank_drug_names": blank_drug_names,
+        "blank_reaction_names": blank_reaction_names,
+    }
+    if null_report_ids:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: "
+            f"{null_report_ids} report record(s) have a null safetyreportid. "
+            "No Silver tables were written."
+        )
+    for name in ("blank_drug_names", "blank_reaction_names"):
+        if metrics[name]:
+            logger.warning(
+                f"Raw data-quality warning — {name}: {metrics[name]} "
+                "(these child records will be excluded during extraction)"
+            )
+    return metrics
 
 
 def extract_reports(df: DataFrame) -> DataFrame:
@@ -130,9 +181,10 @@ def normalize_age(df: DataFrame) -> DataFrame:
 def extract_drugs(df: DataFrame) -> DataFrame:
     """Extract one row per drug within each FDA report.
 
-    Grain: one row per (report_id, report_version, drug_name). The version tag
-    is used to keep only child rows from the LATEST version of each report
-    (see keep_children_of_latest_reports) and is dropped before the MERGE.
+    Grain: one row per (report_id, report_version, drug_name). If a drug has
+    multiple roles in one report version, retain the highest-priority role
+    deterministically: Suspect (1), then Concomitant (2), then Interacting (3).
+    The version tag is dropped before the MERGE.
     Rows with a null/blank drug name are dropped — an unnamed drug would
     violate the persisted table grain (report_id, drug_name).
     """
@@ -156,6 +208,8 @@ def extract_drugs(df: DataFrame) -> DataFrame:
             & col("drug_name").isNotNull()
             & (col("drug_name") != "")
         )
+        .groupBy("report_id", "report_version", "drug_name")
+        .agg(_min("drug_characterization").alias("drug_characterization"))
     )
 
 
@@ -222,11 +276,10 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
                    version_col: str = None, delete_not_matched_by_source: bool = False) -> None:
     """Idempotent MERGE — deduplicate source on the merge key, then upsert.
 
-    Source dedup prevents DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
-    when the same bronze data is processed more than once. If the same drug
-    appears twice in one report (e.g., as both Suspect and Concomitant), only
-    the first occurrence is kept — acceptable because gold counts unique
-    reports per drug, not characterization roles.
+    Source extraction must resolve conflicting non-key attributes before this
+    function. In particular, extract_drugs applies a documented deterministic
+    role priority; dropDuplicates here only collapses otherwise equivalent
+    repeated source rows from append-only Bronze history.
 
     version_col: when set (reports table), the update is guarded so an older
     source version can never overwrite a newer target row.
@@ -300,6 +353,10 @@ if __name__ == "__main__":
     logger.info("Starting Silver Layer Pipeline Execution...")
 
     raw_df = read_bronze_data(spark, BRONZE_JSON_PATH)
+
+    # Validate source records BEFORE extraction filters null IDs or blank child names.
+    raw_dq_metrics = validate_raw_input(raw_df)
+    logger.info(f"Raw input quality metrics: {raw_dq_metrics}")
 
     # Extract each entity independently — NO drug x reaction Cartesian product
     df_reports_all = raw_df.transform(extract_reports).transform(normalize_age)
