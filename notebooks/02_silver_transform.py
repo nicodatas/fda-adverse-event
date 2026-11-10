@@ -81,6 +81,13 @@ def validate_raw_input(df: DataFrame) -> dict:
     them. This prevents post-extraction metrics from hiding rejected input.
     """
     reports = df.select(explode(col("results")).alias("result"))
+    raw_report_count = reports.count()
+    if raw_report_count == 0:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: no raw report records found in Bronze. "
+            "Refusing to run child-table synchronization against an empty source."
+        )
+
     null_report_ids = reports.agg(
         _sum(when(col("result.safetyreportid").isNull(), 1).otherwise(0)).alias("n")
     ).first()["n"] or 0
@@ -338,6 +345,13 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
     logger.info(f"MERGE complete: {table_name}")
 
 
+# Validate raw Bronze before any Silver DDL, migration, or MERGE.
+# This must run first: an invalid/empty source must never mutate existing tables.
+raw_df = read_bronze_data(spark, BRONZE_JSON_PATH)
+raw_dq_metrics = validate_raw_input(raw_df)
+logger.info(f"Raw input quality metrics: {raw_dq_metrics}")
+
+
 # -- Table DDL ----------------------------------------------------------------
 # No partitioning: the dataset is small (~55K rows). Partitioning by report_date
 # would create many tiny partitions with no meaningful performance benefit.
@@ -383,12 +397,6 @@ if "report_version" not in existing_cols:
 
 if __name__ == "__main__":
     logger.info("Starting Silver Layer Pipeline Execution...")
-
-    raw_df = read_bronze_data(spark, BRONZE_JSON_PATH)
-
-    # Validate source records BEFORE extraction filters null IDs or blank child names.
-    raw_dq_metrics = validate_raw_input(raw_df)
-    logger.info(f"Raw input quality metrics: {raw_dq_metrics}")
 
     # Extract each entity independently — NO drug x reaction Cartesian product
     df_reports_all = raw_df.transform(extract_reports).transform(normalize_age)
