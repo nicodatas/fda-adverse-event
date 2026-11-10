@@ -190,7 +190,7 @@ def make_bronze_df(spark_session):
                         StructField("drugcharacterization", StringType()),
                     ]))),
                     StructField("reaction", ArrayType(StructType([
-                        StructField("reactionmedrapt", StringType()),
+                        StructField("reactionmeddrapt", StringType()),
                     ]))),
                 ])),
             ]))),

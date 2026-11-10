@@ -146,7 +146,7 @@ VERSIONED_RAW = [
         "patient": {
             "patientsex": "1",
             "drug": [{"medicinalproduct": "DRUG A"}, {"medicinalproduct": "DRUG B"}],
-            "reaction": [{"reactionmedrapt": "HEADACHE"}],
+            "reaction": [{"reactionmeddrapt": "HEADACHE"}],
         },
     },
     {
@@ -157,7 +157,7 @@ VERSIONED_RAW = [
         "patient": {
             "patientsex": "1",
             "drug": [{"medicinalproduct": "DRUG B"}],
-            "reaction": [{"reactionmedrapt": "HEADACHE"}],
+            "reaction": [{"reactionmeddrapt": "HEADACHE"}],
         },
     },
     {
@@ -167,7 +167,7 @@ VERSIONED_RAW = [
         "patient": {
             "patientsex": "2",
             "drug": [{"medicinalproduct": "DRUG B"}],
-            "reaction": [{"reactionmedrapt": "NAUSEA"}],
+            "reaction": [{"reactionmeddrapt": "NAUSEA"}],
         },
     },
 ]

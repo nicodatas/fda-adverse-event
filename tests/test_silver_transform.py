@@ -28,9 +28,9 @@ RAW_REPORTS = [
                 {"medicinalproduct": "   ", "drugcharacterization": "3"},
             ],
             "reaction": [
-                {"reactionmedrapt": " Headache "},
-                {"reactionmedrapt": ""},
-                {"reactionmedrapt": "   "},
+                {"reactionmeddrapt": " Headache "},
+                {"reactionmeddrapt": ""},
+                {"reactionmeddrapt": "   "},
             ],
         },
     },
@@ -45,7 +45,7 @@ RAW_REPORTS = [
                 {"medicinalproduct": "DRUG A"},
                 {"medicinalproduct": "DRUG C"},
             ],
-            "reaction": [{"reactionmedrapt": "Headache"}],
+            "reaction": [{"reactionmeddrapt": "Headache"}],
         },
     },
     {
@@ -57,7 +57,7 @@ RAW_REPORTS = [
             "patientonsetage": "6",
             "patientonsetageunit": "802",
             "drug": [{"medicinalproduct": "DRUG A", "drugcharacterization": "1"}],
-            "reaction": [{"reactionmedrapt": "Headache"}],
+            "reaction": [{"reactionmeddrapt": "Headache"}],
         },
     },
     {
@@ -66,7 +66,7 @@ RAW_REPORTS = [
         "patient": {
             "patientsex": "0",
             "drug": [{"medicinalproduct": "Drug B"}],
-            "reaction": [{"reactionmedrapt": "Rash"}],
+            "reaction": [{"reactionmeddrapt": "Rash"}],
         },
     },
     {
@@ -74,7 +74,7 @@ RAW_REPORTS = [
         "primarysource": {"reportercountry": "US"},
         "patient": {
             "drug": [{"medicinalproduct": "X"}],
-            "reaction": [{"reactionmedrapt": "Y"}],
+            "reaction": [{"reactionmeddrapt": "Y"}],
         },
     },
 ]

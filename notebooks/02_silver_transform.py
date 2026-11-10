@@ -177,7 +177,7 @@ def extract_reactions(df: DataFrame) -> DataFrame:
         df_reactions.select(
             col("report_id"),
             col("report_version"),
-            upper(trim(col("reaction_info.reactionmedrapt"))).alias("adverse_reaction"),
+            upper(trim(col("reaction_info.reactionmeddrapt"))).alias("adverse_reaction"),
         )
         .filter(
             col("report_id").isNotNull()
