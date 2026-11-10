@@ -80,6 +80,7 @@ def _base_namespace():
             countDistinct,
             date_format,
             explode,
+            explode_outer,
             lit,
             round,
             row_number,
@@ -89,6 +90,7 @@ def _base_namespace():
             when,
         )
         from pyspark.sql.functions import max as _max
+        from pyspark.sql.functions import min as _min
         from pyspark.sql.functions import sum as _sum
         from pyspark.sql.window import Window
 
@@ -102,6 +104,7 @@ def _base_namespace():
             "countDistinct": countDistinct,
             "date_format": date_format,
             "explode": explode,
+            "explode_outer": explode_outer,
             "lit": lit,
             "round": round,
             "row_number": row_number,
@@ -110,6 +113,7 @@ def _base_namespace():
             "upper": upper,
             "when": when,
             "_max": _max,
+            "_min": _min,
             "_sum": _sum,
             "Window": Window,
         })
@@ -250,6 +254,7 @@ def bronze_with_key():
 
 SILVER_FUNCTIONS = (
     "read_bronze_data",
+    "validate_raw_input",
     "extract_reports",
     "normalize_age",
     "extract_drugs",
