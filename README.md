@@ -61,7 +61,7 @@ flowchart LR
 ## Engineering Highlights
 
 - **Idempotent by design.** Each Delta table MERGE is atomic on its own; the three Silver MERGEs are not one cross-table transaction. The Silver task is retried and can be safely replayed from the full Bronze history to converge after a partial failure. Bronze preserves every ingestion run.
-- **Version-aware upserts.** openFDA reports carry `safetyreportversion`; silver keeps only the highest version of each report, and the guarded MERGE update condition (`source.report_version >= coalesce(target.report_version, 0)`) prevents a late-arriving older version from overwriting a newer row.
+- **Version-aware upserts.** openFDA reports carry `safetyreportversion`; silver keeps only the highest version of each report, and only a strictly newer version can update an existing report; equal versions are immutable, and conflicting same-version payloads fail before any write.
 - **Child-table sync.** When an updated report version drops a drug or reaction, the child MERGE (`whenNotMatchedBySourceDelete`) removes the stale target row. This operation relies on Silver reading the complete append-only Bronze history on every run.
 - **Raw and table-level quality checks.** Before any Silver write, the pipeline validates raw report IDs and rejects conflicting payloads that share the same report ID/version. Blank drug/reaction terms are counted and warned about before extraction filters them. After the MERGEs, table-level checks verify grain and referential integrity; a failure blocks Gold.
 - **Soft warnings.** Null dates, invalid sex/age values, and blank names are logged as warnings without blocking execution.
@@ -70,6 +70,27 @@ flowchart LR
 - **Tested.** Pytest covers bronze API error paths and key redaction, silver normalization/version selection/raw quality gates/Delta MERGE semantics, and gold aggregation fan-out safety. CI runs lint and the local Spark/Delta integration suite.
 - **Governed tables.** Unity Catalog provides governance and lineage, with documented Gold tables.
 
+## Interview Walkthrough
+
+**60-second project explanation**
+
+> I built a batch data pipeline using openFDA adverse-event reports. Bronze stores the original API responses as append-only JSON, with pagination, retries and secret redaction. Silver uses PySpark to normalize reports, drugs and reactions into separate Delta tables, preserving their grains and avoiding a drug-by-reaction Cartesian join. I added report-version handling, raw-input quality checks and Delta MERGE operations so reruns are repeatable. Gold produces dashboard-ready aggregates, and GitHub Actions runs lint plus local Spark/Delta tests. The main design trade-off is that each Delta table write is atomic, but the three-table Silver update is not a single transaction; the job retries and replays the full Bronze history to converge after a partial failure.
+
+**Design decisions to be ready to explain**
+
+- **Why medallion architecture?** Bronze preserves source evidence; Silver owns cleansing, entity grains and integrity; Gold serves analytics without repeating transformations.
+- **Why separate drug and reaction tables?** Exploding both arrays in one transformation would multiply rows and inflate counts. Separate child tables retain each relationship to the report without implying a drug caused a specific reaction.
+- **How are report updates handled?** Select the highest safetyreportversion; reject conflicting payloads for the same ID/version; update an existing report only when the incoming version is strictly newer.
+- **How do reruns work?** Bronze is append-only. Silver reads the complete Bronze history, deduplicates equivalent records and re-applies idempotent Delta MERGEs. Child-table sync removes rows absent from the latest full-history source.
+- **What is not transactional?** A Delta MERGE is atomic per table, not across reports, drugs and reactions. The Silver task retries and a full-history replay repairs a partial run. This is an explicit recovery strategy, not a claim of cross-table atomicity.
+- **What do the metrics mean?** They count submitted reports, not confirmed adverse effects or causal evidence. FAERS is a spontaneous-reporting system and is subject to reporting bias.
+
+**Known scope and limitations**
+
+- This is a batch portfolio project, not a production pharmacovigilance system.
+- The current ingestion is deliberately capped at 5,000 records per run; expanding historical coverage and incremental ingestion are future work.
+- The local Spark/Delta suite validates transformation and MERGE behavior, but it does not prove that the complete pipeline has run successfully in every Databricks workspace configuration.
+- Databricks bundle validation in CI requires workspace credentials; without them that CI job reports a skip.
 ## Dashboard
 
 A single-page overview of the adverse event data:
