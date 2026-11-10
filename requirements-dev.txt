@@ -1,0 +1,7 @@
+# Test and lint dependencies for local development and CI.
+# pyspark + delta-spark provide the local Spark/Delta runtime used by the
+# silver and gold tests (a JDK 17 runtime is required for those).
+pytest>=8.0
+flake8>=7.0
+pyspark==3.5.5
+delta-spark==3.3.0

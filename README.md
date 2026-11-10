@@ -36,9 +36,9 @@ flowchart LR
 
 | Layer | Notebook | Responsibility |
 |---|---|---|
-| **Bronze** | `01_bronze_ingest` | Fetches raw JSON from the openFDA API with pagination, retry logic, and streaming writes. Each run is tagged with a unique `run_id` timestamp, so re-runs append rather than overwrite. |
-| **Silver** | `02_silver_transform` | Parses JSON into three normalized Delta tables, handles array explosions, normalizes patient age from multiple NCIT unit codes, and enforces hard quality gates. |
-| **Gold** | `03_gold_aggregate` | Pre-aggregates by country, drug, and reaction over time using `countDistinct(report_id)` to avoid inflated counts. Tables include Unity Catalog comments and FAERS disclaimers. |
+| **Bronze** | `01_bronze_ingest` | Fetches raw JSON from the openFDA API with pagination (HTTP 404 = clean end of results), transient-only retries (429/5xx) with exponential backoff, request timeouts, streaming writes, and API-key redaction in every logged or raised message. Each run is tagged with a unique `run_id` timestamp, so re-runs append rather than overwrite. |
+| **Silver** | `02_silver_transform` | Parses JSON into three normalized Delta tables with explicit grains, normalizes patient age from multiple NCIT unit codes, keeps only the latest `safetyreportversion` of each report, synchronizes drug/reaction child rows via `whenNotMatchedBySourceDelete`, and enforces hard quality gates. |
+| **Gold** | `03_gold_aggregate` | Pre-aggregates by country, drug, and reaction over time using `countDistinct(report_id)` to avoid inflated counts from join fan-out; reports with unparseable dates are excluded from the monthly trend and logged. Tables include Unity Catalog comments and FAERS disclaimers. |
 
 ## Data Model
 
@@ -60,10 +60,14 @@ flowchart LR
 
 ## Engineering Highlights
 
-- **Idempotent by design.** Silver uses Delta `MERGE` on composite keys, so re-running on the same data is safe. Bronze preserves every ingestion run, and Silver deduplicates on grain.
-- **Hard quality gates.** The Silver transform fails fast on null or duplicate `report_id` (grain violation) and on orphan drug/reaction records (referential integrity). A failure raises a `RuntimeError` and skips all downstream tasks.
-- **Soft warnings.** Issues such as null dates or invalid ages are logged without blocking execution.
-- **Resilient ingestion.** Pagination and retry logic handle API limits; without an API key the pipeline falls back to unauthenticated requests (500 records per page instead of 1,000).
+- **Idempotent by design.** Silver uses Delta `MERGE` on composite keys with source-side deduplication, so re-running on the same data is safe. Bronze preserves every ingestion run.
+- **Version-aware upserts.** openFDA reports carry `safetyreportversion`; silver keeps only the highest version of each report, and the guarded MERGE update condition (`source.report_version >= coalesce(target.report_version, 0)`) prevents a late-arriving older version from overwriting a newer row.
+- **Child-table sync.** When an updated report version drops a drug or reaction, the child MERGE (`whenNotMatchedBySourceDelete`) removes the stale target row — orphaned child rows cannot accumulate.
+- **Hard quality gates.** Silver fails fast on null or duplicate `report_id` (grain violation) and on orphan drug/reaction records (referential integrity). A failure raises a `RuntimeError` and skips all downstream tasks (`ALL_SUCCESS` dependency in the job).
+- **Soft warnings.** Null dates, invalid sex/age values, and blank names are logged as warnings without blocking execution.
+- **Secret hygiene.** openFDA only accepts the API key as a URL query parameter, so `requests` exception messages embed it. Bronze redacts every logged or raised message and never re-raises the original exception (`raise ... from None`).
+- **Resilient ingestion.** HTTP 404 past the first page is treated as a clean end-of-pagination; only transient errors (429, 5xx, network) are retried; permanent 4xx fails fast. Without an API key the pipeline falls back to unauthenticated requests (500 records per page instead of 1,000).
+- **Tested.** A suite of 50 tests (pure Python plus local Spark/Delta integration) covers bronze API error paths and key redaction, silver normalization/versioning/MERGE semantics/quality gates, and gold aggregation fan-out safety.
 - **Governed tables.** Unity Catalog provides governance and lineage, with documented Gold tables.
 
 ## Dashboard
@@ -95,6 +99,18 @@ A single-page overview of the adverse event data:
 databricks bundle deploy
 ```
 
+**Local development & tests.** The test suite runs Spark locally — no Databricks workspace needed:
+
+```bash
+pip install -r requirements-dev.txt   # pytest, flake8, pyspark, delta-spark
+pytest -v                             # JDK 17 required for the Spark tests
+flake8 notebooks/ tests/               # max-line-length 120, no error codes ignored
+```
+
+Tests extract the transformation functions from the notebook sources via AST (so no Databricks session is needed) and run them against a local Spark + Delta session, covering bronze API error paths and key redaction, silver normalization/versioning/MERGE semantics/quality gates, and gold aggregation fan-out safety.
+
+**CI (GitHub Actions)** runs three jobs on every push and pull request: flake8 lint over notebooks and tests, the pytest suite on Ubuntu with Temurin JDK 17, and `databricks bundle validate` (skipped with a notice when workspace credentials are not configured).
+
 ## Tech Stack
 
 | Component | Technology |
@@ -108,8 +124,8 @@ databricks bundle deploy
 
 ## Roadmap
 
-- [ ] Add automated tests for the transform logic
-- [ ] Add CI with GitHub Actions
+- [x] Automated tests for the transform logic (pytest, local Spark + Delta)
+- [x] CI with GitHub Actions (lint, tests, bundle validation)
 - [ ] Orchestrate with Apache Airflow as an alternative to bundles
 - [ ] Expand ingestion beyond the current 5,000-report sample
 

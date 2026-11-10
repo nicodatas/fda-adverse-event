@@ -20,8 +20,32 @@ jobs:
       - name: Install flake8
         run: pip install flake8
 
-      - name: Lint notebook source files
-        run: flake8 notebooks/ --count --statistics
+      - name: Lint notebook and test sources
+        run: flake8 notebooks/ tests/ --count --statistics
+
+  test:
+    name: Unit & integration tests (pytest, local Spark + Delta)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Collect tests
+        run: pytest --collect-only -q
+
+      - name: Run tests
+        run: pytest -v
 
   validate-bundle:
     name: Validate Databricks bundle

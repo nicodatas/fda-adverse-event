@@ -25,3 +25,9 @@ Thumbs.db
 # Environment & secrets
 .env
 *.env
+
+# Testing & local dev
+.pytest_cache/
+.venv/
+.coverage
+target/

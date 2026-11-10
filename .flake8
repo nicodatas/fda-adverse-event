@@ -1,4 +1,6 @@
 [flake8]
 max-line-length = 120
-extend-ignore = E203, W503, F401, F811, E402, E501, W292, F541, F821, E128
-exclude = .git, __pycache__, .databricks, build, dist
+# E203/W503 conflict with standard (black-style) formatting conventions
+# W292: Databricks .py notebook exports may omit the trailing newline
+extend-ignore = E203, W503, W292
+exclude = .git, __pycache__, .databricks, .pytest_cache, .venv, build, dist
