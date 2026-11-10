@@ -39,6 +39,7 @@ from pyspark.sql.functions import (
     row_number,
     to_date,
     trim,
+    to_json,
     upper,
     when,
 )
@@ -81,6 +82,29 @@ def validate_raw_input(df: DataFrame) -> dict:
         _sum(when(col("result.safetyreportid").isNull(), 1).otherwise(0)).alias("n")
     ).first()["n"] or 0
 
+    # Identical copies of a report version are expected in append-only Bronze.
+    # Conflicting payloads with the same report ID + version are ambiguous and
+    # must not be resolved by an arbitrary row_number() tie.
+    versioned = reports.select(
+        col("result.safetyreportid").alias("report_id"),
+        coalesce(col("result.safetyreportversion").cast("int"), lit(0)).alias(
+            "report_version"
+        ),
+        to_json(col("result")).alias("_payload"),
+    ).filter(col("report_id").isNotNull())
+    conflicting_versions = (
+        versioned.groupBy("report_id", "report_version")
+        .agg(countDistinct("_payload").alias("payload_versions"))
+        .filter(col("payload_versions") > 1)
+        .count()
+    )
+    if conflicting_versions:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: "
+            f"{conflicting_versions} report ID/version key(s) have conflicting "
+            "payloads. Resolve the source conflict before writing Silver."
+        )
+
     drug_rows = reports.select(
         explode(col("result.patient.drug")).alias("drug_info")
     )
@@ -99,6 +123,7 @@ def validate_raw_input(df: DataFrame) -> dict:
 
     metrics = {
         "null_report_ids": null_report_ids,
+        "conflicting_report_versions": conflicting_versions,
         "blank_drug_names": blank_drug_names,
         "blank_reaction_names": blank_reaction_names,
     }
@@ -242,7 +267,11 @@ def extract_reactions(df: DataFrame) -> DataFrame:
 
 def keep_latest_version(df: DataFrame, key_cols: list,
                         version_col: str = "report_version") -> DataFrame:
-    """Keep one row per key: the highest report version (ties: latest report_date)."""
+    """Keep one row per key: highest version, then latest report_date.
+
+    validate_raw_input rejects conflicting payloads for the same report/version,
+    so remaining ties are identical source copies and row choice is immaterial.
+    """
     order_cols = [col(version_col).desc()]
     if "report_date" in df.columns:
         order_cols.append(col("report_date").desc())
@@ -280,8 +309,9 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
     role priority; dropDuplicates here only collapses otherwise equivalent
     repeated source rows from append-only Bronze history.
 
-    version_col: when set (reports table), the update is guarded so an older
-    source version can never overwrite a newer target row.
+    version_col: when set (reports table), only a strictly newer source version
+    can update the target. Equal versions are immutable; conflicting equal-version
+    payloads are rejected by validate_raw_input before any table is written.
 
     delete_not_matched_by_source: when True (child tables), target rows absent
     from the source are deleted — synchronizes child tables when an updated
@@ -294,7 +324,7 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
     merge_builder = delta_table.alias("target").merge(df.alias("source"), merge_condition)
     if version_col:
         merge_builder = merge_builder.whenMatchedUpdateAll(
-            condition=f"source.{version_col} >= coalesce(target.{version_col}, 0)"
+            condition=f"source.{version_col} > coalesce(target.{version_col}, 0)"
         )
     else:
         merge_builder = merge_builder.whenMatchedUpdateAll()
