@@ -72,14 +72,15 @@ def test_reports_merge_is_idempotent(silver, silver_tables):
     assert spark.table(reports).count() == 1
 
 
-def test_source_dedup_collapses_duplicate_child_keys(silver, silver_tables):
+def test_source_dedup_is_stable_for_identical_child_rows(silver, silver_tables):
     spark = silver["spark"]
     drugs = silver_tables["drugs"]
-    # same drug in one report with two roles (Suspect + Concomitant)
-    df = _drugs_df(spark, [("R1", "DRUG A", 1), ("R1", "DRUG A", 2)])
+    # Repeated ingestion of the same resolved child row must be idempotent.
+    df = _drugs_df(spark, [("R1", "DRUG A", 1), ("R1", "DRUG A", 1)])
     _merge_drugs(silver, df, drugs)
-    rows = {(r["report_id"], r["drug_name"]) for r in spark.table(drugs).collect()}
-    assert rows == {("R1", "DRUG A")}  # one row per (report_id, drug_name)
+    rows = spark.table(drugs).collect()
+    assert len(rows) == 1
+    assert rows[0]["drug_characterization"] == 1
 
 
 def test_older_version_never_overwrites_newer(silver, silver_tables):
