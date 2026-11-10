@@ -34,7 +34,6 @@ from pyspark.sql.functions import (
     count,
     countDistinct,
     explode,
-    explode_outer,
     lit,
     round,
     row_number,
@@ -83,7 +82,7 @@ def validate_raw_input(df: DataFrame) -> dict:
     ).first()["n"] or 0
 
     drug_rows = reports.select(
-        explode_outer(col("result.patient.drug")).alias("drug_info")
+        explode(col("result.patient.drug")).alias("drug_info")
     )
     blank_drug_names = drug_rows.filter(
         col("drug_info.medicinalproduct").isNull()
@@ -91,7 +90,7 @@ def validate_raw_input(df: DataFrame) -> dict:
     ).count()
 
     reaction_rows = reports.select(
-        explode_outer(col("result.patient.reaction")).alias("reaction_info")
+        explode(col("result.patient.reaction")).alias("reaction_info")
     )
     blank_reaction_names = reaction_rows.filter(
         col("reaction_info.reactionmeddrapt").isNull()
