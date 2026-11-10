@@ -4,6 +4,7 @@ Runs against a local Spark session (conftest.spark_session); raw input is
 built from openFDA-shaped dicts via the make_bronze_df factory.
 """
 import datetime
+from pathlib import Path
 
 import pytest
 from pyspark.sql.types import (
@@ -83,6 +84,21 @@ RAW_REPORTS = [
 def _extract_reports(silver, make_bronze_df, tmp_path):
     raw = make_bronze_df(RAW_REPORTS, tmp_path)
     return silver["extract_reports"](raw)
+
+
+def test_empty_raw_bronze_fails_closed_before_silver_mutations(silver, make_bronze_df, tmp_path):
+    raw = make_bronze_df([], tmp_path)
+    with pytest.raises(RuntimeError, match="no raw report records"):
+        silver["validate_raw_input"](raw)
+
+
+def test_notebook_validates_raw_bronze_before_silver_ddl_and_migration():
+    source = Path("notebooks/02_silver_transform.py").read_text()
+    validation = source.index("raw_dq_metrics = validate_raw_input(raw_df)")
+    schema_ddl = source.index('spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.silver")')
+    table_ddl = source.index("CREATE TABLE IF NOT EXISTS {REPORTS_TABLE}")
+    migration = source.index("ALTER TABLE {REPORTS_TABLE} ADD COLUMN report_version INT")
+    assert validation < schema_ddl < table_ddl < migration
 
 
 # -- extract_reports ---------------------------------------------------------
