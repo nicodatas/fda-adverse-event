@@ -98,6 +98,17 @@ def test_raw_validation_fails_before_null_report_id_is_filtered(silver, make_bro
         silver["validate_raw_input"](raw)
 
 
+def test_raw_validation_rejects_conflicting_same_version_payloads(silver, make_bronze_df, tmp_path):
+    raw = make_bronze_df([
+        {"safetyreportid": "R1", "safetyreportversion": "2",
+         "primarysource": {"reportercountry": "US"}},
+        {"safetyreportid": "R1", "safetyreportversion": "2",
+         "primarysource": {"reportercountry": "CA"}},
+    ], tmp_path)
+    with pytest.raises(RuntimeError, match="conflicting payloads"):
+        silver["validate_raw_input"](raw)
+
+
 def test_raw_validation_counts_blank_children_before_extraction(silver, make_bronze_df, tmp_path):
     raw = make_bronze_df(RAW_REPORTS[:-1], tmp_path)
     metrics = silver["validate_raw_input"](raw)
