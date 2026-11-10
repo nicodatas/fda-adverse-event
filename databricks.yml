@@ -20,7 +20,9 @@ resources:
             - task_key: bronze_ingest
           notebook_task:
             notebook_path: notebooks/02_silver_transform.py
-          description: "Transform into 3 silver Delta tables with quality gates and MERGE"
+          description: "Validate raw records, then transform into 3 silver Delta tables with version-aware MERGE"
+          max_retries: 2
+          min_retry_interval_millis: 30000
 
         - task_key: gold_aggregate
           depends_on:
