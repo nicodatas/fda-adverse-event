@@ -96,16 +96,16 @@ def test_older_version_never_overwrites_newer(silver, silver_tables):
     assert rows[0]["report_version"] == 2
 
 
-def test_same_version_update_is_allowed(silver, silver_tables):
+def test_same_version_update_is_ignored(silver, silver_tables):
     spark = silver["spark"]
     reports = silver_tables["reports"]
     v1a = _reports_df(spark, [("R1", D1, "US", "MALE", "40", "801", 40.0, 1)])
     v1b = _reports_df(spark, [("R1", D1, "USA", "MALE", "40", "801", 40.0, 1)])
     _merge_reports(silver, v1a, reports)
-    _merge_reports(silver, v1b, reports)  # equal version: update permitted
+    _merge_reports(silver, v1b, reports)  # equal version is immutable
     rows = spark.table(reports).collect()
     assert len(rows) == 1
-    assert rows[0]["country"] == "USA"
+    assert rows[0]["country"] == "US"
 
 
 def test_child_sync_removes_obsolete_drugs(silver, silver_tables):
