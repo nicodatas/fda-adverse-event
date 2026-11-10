@@ -84,11 +84,13 @@ def _base_namespace():
             round,
             row_number,
             to_date,
+            to_json,
             trim,
             upper,
             when,
         )
         from pyspark.sql.functions import max as _max
+        from pyspark.sql.functions import min as _min
         from pyspark.sql.functions import sum as _sum
         from pyspark.sql.window import Window
 
@@ -106,10 +108,12 @@ def _base_namespace():
             "round": round,
             "row_number": row_number,
             "to_date": to_date,
+            "to_json": to_json,
             "trim": trim,
             "upper": upper,
             "when": when,
             "_max": _max,
+            "_min": _min,
             "_sum": _sum,
             "Window": Window,
         })
@@ -250,6 +254,7 @@ def bronze_with_key():
 
 SILVER_FUNCTIONS = (
     "read_bronze_data",
+    "validate_raw_input",
     "extract_reports",
     "normalize_age",
     "extract_drugs",

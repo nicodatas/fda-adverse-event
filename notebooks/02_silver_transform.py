@@ -11,15 +11,18 @@
 # MAGIC
 # MAGIC Drugs and reactions are extracted independently to avoid a drug×reaction Cartesian product.
 # MAGIC The `report_id` column links the three entities. No drug-to-reaction causal relationship is implied.
+# MAGIC Drug-role conflicts for the same normalized drug resolve deterministically: Suspect (1),
+# MAGIC then Concomitant (2), then Interacting (3).
 # MAGIC
-# MAGIC **Report versioning:** openFDA reports carry `safetyreportversion`. When the same report appears
-# MAGIC multiple times in bronze (repeated ingestion or follow-up versions), silver keeps only the highest
-# MAGIC version — and the MERGE update is guarded so an older version can never overwrite a newer one.
+# MAGIC **Report versioning:** openFDA reports carry `safetyreportversion`. Identical copies are expected in
+# MAGIC append-only Bronze, but conflicting payloads with the same report ID/version fail before writes.
+# MAGIC Silver keeps the highest version; only a strictly newer version may update an existing report.
 # MAGIC Child rows (drugs/reactions) are kept only from the latest version of each report, and the child
 # MAGIC MERGE deletes target rows that are no longer present in the source (child-table sync).
 # MAGIC
-# MAGIC **Assumption:** silver re-reads the COMPLETE bronze history on every run (bronze files are
-# MAGIC append-only). All version-collision and child-sync logic depends on that assumption.
+# MAGIC **Assumption and recovery:** silver re-reads the COMPLETE bronze history on every run (bronze files
+# MAGIC are append-only). Each Delta MERGE is atomic individually, not across all three tables. A task retry
+# MAGIC replays the full history to converge after a partial multi-table write.
 
 # COMMAND ----------
 
@@ -39,10 +42,12 @@ from pyspark.sql.functions import (
     row_number,
     to_date,
     trim,
+    to_json,
     upper,
     when,
 )
 from pyspark.sql.functions import max as _max
+from pyspark.sql.functions import min as _min
 from pyspark.sql.functions import sum as _sum
 from pyspark.sql.window import Window
 
@@ -65,6 +70,86 @@ def read_bronze_data(spark_session: SparkSession, path: str) -> DataFrame:
     logger.info(f"Reading raw JSON data from path: {path}")
     # multiline=true because openFDA returns pretty-printed JSON, not JSONL
     return spark_session.read.option("multiline", "true").json(path)
+
+
+def validate_raw_input(df: DataFrame) -> dict:
+    """Validate raw openFDA records before extraction can filter anything.
+
+    A report without safetyreportid is a hard failure because its children
+    cannot be related to a parent. Blank drug/reaction terms are soft anomalies:
+    they are counted and warned about before the extraction functions discard
+    them. This prevents post-extraction metrics from hiding rejected input.
+    """
+    reports = df.select(explode(col("results")).alias("result"))
+    raw_report_count = reports.count()
+    if raw_report_count == 0:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: no raw report records found in Bronze. "
+            "Refusing to run child-table synchronization against an empty source."
+        )
+
+    null_report_ids = reports.agg(
+        _sum(when(col("result.safetyreportid").isNull(), 1).otherwise(0)).alias("n")
+    ).first()["n"] or 0
+
+    # Identical copies of a report version are expected in append-only Bronze.
+    # Conflicting payloads with the same report ID + version are ambiguous and
+    # must not be resolved by an arbitrary row_number() tie.
+    versioned = reports.select(
+        col("result.safetyreportid").alias("report_id"),
+        coalesce(col("result.safetyreportversion").cast("int"), lit(0)).alias(
+            "report_version"
+        ),
+        to_json(col("result")).alias("_payload"),
+    ).filter(col("report_id").isNotNull())
+    conflicting_versions = (
+        versioned.groupBy("report_id", "report_version")
+        .agg(countDistinct("_payload").alias("payload_versions"))
+        .filter(col("payload_versions") > 1)
+        .count()
+    )
+    if conflicting_versions:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: "
+            f"{conflicting_versions} report ID/version key(s) have conflicting "
+            "payloads. Resolve the source conflict before writing Silver."
+        )
+
+    drug_rows = reports.select(
+        explode(col("result.patient.drug")).alias("drug_info")
+    )
+    blank_drug_names = drug_rows.filter(
+        col("drug_info.medicinalproduct").isNull()
+        | (trim(col("drug_info.medicinalproduct")) == "")
+    ).count()
+
+    reaction_rows = reports.select(
+        explode(col("result.patient.reaction")).alias("reaction_info")
+    )
+    blank_reaction_names = reaction_rows.filter(
+        col("reaction_info.reactionmeddrapt").isNull()
+        | (trim(col("reaction_info.reactionmeddrapt")) == "")
+    ).count()
+
+    metrics = {
+        "null_report_ids": null_report_ids,
+        "conflicting_report_versions": conflicting_versions,
+        "blank_drug_names": blank_drug_names,
+        "blank_reaction_names": blank_reaction_names,
+    }
+    if null_report_ids:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: "
+            f"{null_report_ids} report record(s) have a null safetyreportid. "
+            "No Silver tables were written."
+        )
+    for name in ("blank_drug_names", "blank_reaction_names"):
+        if metrics[name]:
+            logger.warning(
+                f"Raw data-quality warning — {name}: {metrics[name]} "
+                "(these child records will be excluded during extraction)"
+            )
+    return metrics
 
 
 def extract_reports(df: DataFrame) -> DataFrame:
@@ -130,9 +215,10 @@ def normalize_age(df: DataFrame) -> DataFrame:
 def extract_drugs(df: DataFrame) -> DataFrame:
     """Extract one row per drug within each FDA report.
 
-    Grain: one row per (report_id, report_version, drug_name). The version tag
-    is used to keep only child rows from the LATEST version of each report
-    (see keep_children_of_latest_reports) and is dropped before the MERGE.
+    Grain: one row per (report_id, report_version, drug_name). If a drug has
+    multiple roles in one report version, retain the highest-priority role
+    deterministically: Suspect (1), then Concomitant (2), then Interacting (3).
+    The version tag is dropped before the MERGE.
     Rows with a null/blank drug name are dropped — an unnamed drug would
     violate the persisted table grain (report_id, drug_name).
     """
@@ -156,6 +242,8 @@ def extract_drugs(df: DataFrame) -> DataFrame:
             & col("drug_name").isNotNull()
             & (col("drug_name") != "")
         )
+        .groupBy("report_id", "report_version", "drug_name")
+        .agg(_min("drug_characterization").alias("drug_characterization"))
     )
 
 
@@ -189,7 +277,11 @@ def extract_reactions(df: DataFrame) -> DataFrame:
 
 def keep_latest_version(df: DataFrame, key_cols: list,
                         version_col: str = "report_version") -> DataFrame:
-    """Keep one row per key: the highest report version (ties: latest report_date)."""
+    """Keep one row per key: highest version, then latest report_date.
+
+    validate_raw_input rejects conflicting payloads for the same report/version,
+    so remaining ties are identical source copies and row choice is immaterial.
+    """
     order_cols = [col(version_col).desc()]
     if "report_date" in df.columns:
         order_cols.append(col("report_date").desc())
@@ -222,14 +314,14 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
                    version_col: str = None, delete_not_matched_by_source: bool = False) -> None:
     """Idempotent MERGE — deduplicate source on the merge key, then upsert.
 
-    Source dedup prevents DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
-    when the same bronze data is processed more than once. If the same drug
-    appears twice in one report (e.g., as both Suspect and Concomitant), only
-    the first occurrence is kept — acceptable because gold counts unique
-    reports per drug, not characterization roles.
+    Source extraction must resolve conflicting non-key attributes before this
+    function. In particular, extract_drugs applies a documented deterministic
+    role priority; dropDuplicates here only collapses otherwise equivalent
+    repeated source rows from append-only Bronze history.
 
-    version_col: when set (reports table), the update is guarded so an older
-    source version can never overwrite a newer target row.
+    version_col: when set (reports table), only a strictly newer source version
+    can update the target. Equal versions are immutable; conflicting equal-version
+    payloads are rejected by validate_raw_input before any table is written.
 
     delete_not_matched_by_source: when True (child tables), target rows absent
     from the source are deleted — synchronizes child tables when an updated
@@ -242,7 +334,7 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
     merge_builder = delta_table.alias("target").merge(df.alias("source"), merge_condition)
     if version_col:
         merge_builder = merge_builder.whenMatchedUpdateAll(
-            condition=f"source.{version_col} >= coalesce(target.{version_col}, 0)"
+            condition=f"source.{version_col} > coalesce(target.{version_col}, 0)"
         )
     else:
         merge_builder = merge_builder.whenMatchedUpdateAll()
@@ -251,6 +343,13 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
         merge_builder = merge_builder.whenNotMatchedBySourceDelete()
     merge_builder.execute()
     logger.info(f"MERGE complete: {table_name}")
+
+
+# Validate raw Bronze before any Silver DDL, migration, or MERGE.
+# This must run first: an invalid/empty source must never mutate existing tables.
+raw_df = read_bronze_data(spark, BRONZE_JSON_PATH)
+raw_dq_metrics = validate_raw_input(raw_df)
+logger.info(f"Raw input quality metrics: {raw_dq_metrics}")
 
 
 # -- Table DDL ----------------------------------------------------------------
@@ -298,8 +397,6 @@ if "report_version" not in existing_cols:
 
 if __name__ == "__main__":
     logger.info("Starting Silver Layer Pipeline Execution...")
-
-    raw_df = read_bronze_data(spark, BRONZE_JSON_PATH)
 
     # Extract each entity independently — NO drug x reaction Cartesian product
     df_reports_all = raw_df.transform(extract_reports).transform(normalize_age)

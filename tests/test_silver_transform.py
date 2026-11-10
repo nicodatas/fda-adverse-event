@@ -4,6 +4,7 @@ Runs against a local Spark session (conftest.spark_session); raw input is
 built from openFDA-shaped dicts via the make_bronze_df factory.
 """
 import datetime
+from pathlib import Path
 
 import pytest
 from pyspark.sql.types import (
@@ -85,11 +86,66 @@ def _extract_reports(silver, make_bronze_df, tmp_path):
     return silver["extract_reports"](raw)
 
 
+def test_empty_raw_bronze_fails_closed_before_silver_mutations(silver, make_bronze_df, tmp_path):
+    raw = make_bronze_df([], tmp_path)
+    with pytest.raises(RuntimeError, match="no raw report records"):
+        silver["validate_raw_input"](raw)
+
+
+def test_notebook_validates_raw_bronze_before_silver_ddl_and_migration():
+    source = Path("notebooks/02_silver_transform.py").read_text()
+    validation = source.index("raw_dq_metrics = validate_raw_input(raw_df)")
+    schema_ddl = source.index('spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.silver")')
+    table_ddl = source.index("CREATE TABLE IF NOT EXISTS {REPORTS_TABLE}")
+    migration = source.index("ALTER TABLE {REPORTS_TABLE} ADD COLUMN report_version INT")
+    assert validation < schema_ddl < table_ddl < migration
+
+
 # -- extract_reports ---------------------------------------------------------
 def test_extract_reports_drops_null_report_ids(silver, make_bronze_df, tmp_path):
     reports = _extract_reports(silver, make_bronze_df, tmp_path).collect()
     ids = sorted({r["report_id"] for r in reports})
     assert ids == ["100", "200", "300"]
+
+
+def test_raw_validation_fails_before_null_report_id_is_filtered(silver, make_bronze_df, tmp_path):
+    raw = make_bronze_df(RAW_REPORTS, tmp_path)
+    with pytest.raises(RuntimeError, match="null safetyreportid"):
+        silver["validate_raw_input"](raw)
+
+
+def test_raw_validation_rejects_conflicting_same_version_payloads(silver, make_bronze_df, tmp_path):
+    raw = make_bronze_df([
+        {"safetyreportid": "R1", "safetyreportversion": "2",
+         "primarysource": {"reportercountry": "US"}},
+        {"safetyreportid": "R1", "safetyreportversion": "2",
+         "primarysource": {"reportercountry": "CA"}},
+    ], tmp_path)
+    with pytest.raises(RuntimeError, match="conflicting payloads"):
+        silver["validate_raw_input"](raw)
+
+
+def test_raw_validation_counts_blank_children_before_extraction(silver, make_bronze_df, tmp_path):
+    raw = make_bronze_df(RAW_REPORTS[:-1], tmp_path)
+    metrics = silver["validate_raw_input"](raw)
+    assert metrics["null_report_ids"] == 0
+    assert metrics["blank_drug_names"] == 2
+    assert metrics["blank_reaction_names"] == 2
+
+
+def test_drug_role_conflict_uses_documented_priority(silver, make_bronze_df, tmp_path):
+    raw = make_bronze_df([{
+        "safetyreportid": "R1",
+        "patient": {"drug": [
+            {"medicinalproduct": "Drug A", "drugcharacterization": "2"},
+            {"medicinalproduct": "DRUG A", "drugcharacterization": "1"},
+            {"medicinalproduct": "Drug A", "drugcharacterization": "3"},
+        ]},
+    }], tmp_path)
+    rows = silver["extract_drugs"](raw).collect()
+    assert len(rows) == 1
+    assert rows[0]["drug_name"] == "DRUG A"
+    assert rows[0]["drug_characterization"] == 1
 
 
 def test_extract_reports_normalizes_country(silver, make_bronze_df, tmp_path):
