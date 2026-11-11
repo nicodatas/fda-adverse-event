@@ -5,12 +5,11 @@
 ![Delta Lake](https://img.shields.io/badge/Delta_Lake-00ADD8)
 ![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
 
-A batch ETL pipeline that ingests drug adverse event reports from the **openFDA API**, processes them through a **medallion architecture** (Bronze → Silver → Gold), and publishes analytics through a **Lakeview (AI/BI) dashboard**. Built on Databricks with Delta Lake and Unity Catalog, and orchestrated with a Declarative Automation Bundle.
+A batch data pipeline that ingests a capped sample of drug adverse-event reports from the **openFDA API**, transforms them through **Bronze → Silver → Gold** Delta tables on Databricks, and prepares analytics for an AI/BI dashboard.
 
-**[View the Live Dashboard](https://dbc-a4bd6c77-a376.cloud.databricks.com/dashboardsv3/01f1c1f6d2611bda9a1ade2a711c3ed2/published?o=7474648475439044)**
+**[Live dashboard (requires Databricks access)](https://dbc-a4bd6c77-a376.cloud.databricks.com/dashboardsv3/01f1c1f6d2611bda9a1ade2a711c3ed2/published?o=7474648475439044)**
 
-<!-- Add a screenshot: save it as docs/dashboard.png and uncomment the line below -->
-<!-- ![Dashboard](docs/dashboard.png) -->
+> Dashboard screenshot: not published yet. The live link requires an authenticated Databricks workspace.
 
 ## Overview
 
@@ -55,7 +54,7 @@ flowchart LR
 | Table | Description |
 |---|---|
 | `fda_reports_by_country` | Unique reports by country |
-| `fda_top_drugs` | Drug rankings with average patient age |
+| `fda_top_drugs` | Suspect-drug rankings (role 1) with average patient age |
 | `fda_reactions_over_time` | Monthly reaction trends |
 
 ## Engineering Highlights
@@ -63,40 +62,36 @@ flowchart LR
 - **Idempotent by design.** Each Delta table MERGE is atomic on its own; the three Silver MERGEs are not one cross-table transaction. The Silver task is retried and can be safely replayed from the full Bronze history to converge after a partial failure. Bronze preserves every ingestion run.
 - **Version-aware upserts.** openFDA reports carry `safetyreportversion`; silver keeps only the highest version of each report, and only a strictly newer version can update an existing report; equal versions are immutable, and conflicting same-version payloads fail before any write.
 - **Child-table sync.** When an updated report version drops a drug or reaction, the child MERGE (`whenNotMatchedBySourceDelete`) removes the stale target row. This operation relies on Silver reading the complete append-only Bronze history on every run.
-- **Raw and table-level quality checks.** Before any Silver write, the pipeline validates raw report IDs and rejects conflicting payloads that share the same report ID/version. Blank drug/reaction terms are counted and warned about before extraction filters them. After the MERGEs, table-level checks verify grain and referential integrity; a failure blocks Gold.
+- **Data quality checks.** Before any Silver write, the pipeline validates raw report IDs and rejects conflicting payloads that share the same report ID/version. Blank drug/reaction terms are counted and warned about before extraction filters them. Table-level grain and referential-integrity gates currently run after the three Silver MERGEs; a failure blocks Gold but does not roll back already-written Silver tables. Moving these gates before the MERGEs is planned work.
 - **Soft warnings.** Null dates, invalid sex/age values, and blank names are logged as warnings without blocking execution.
 - **Secret hygiene.** openFDA only accepts the API key as a URL query parameter, so `requests` exception messages embed it. Bronze redacts every logged or raised message and never re-raises the original exception (`raise ... from None`).
 - **Resilient ingestion.** HTTP 404 past the first page is treated as a clean end-of-pagination; only transient errors (429, 5xx, network) are retried; permanent 4xx fails fast. Without an API key the pipeline falls back to unauthenticated requests (500 records per page instead of 1,000).
-- **Tested.** Pytest covers bronze API error paths and key redaction, silver normalization/version selection/raw quality gates/Delta MERGE semantics, and gold aggregation fan-out safety. CI runs lint and the local Spark/Delta integration suite.
+- **Tested.** Pytest covers bronze API error paths and key redaction, silver normalization/version selection/raw quality gates/Delta MERGE semantics, and gold aggregation fan-out safety, including suspect-only drug rankings. CI runs lint and the local Spark/Delta integration suite.
 - **Governed tables.** Unity Catalog provides governance and lineage, with documented Gold tables.
 
-## Interview Walkthrough
+## Design decisions
 
-**60-second project explanation**
+- **Separate entity grains.** Reports, drugs, and reactions are stored separately to avoid a drug × reaction Cartesian fan-out.
+- **Version-aware updates.** The highest report version wins; only a strictly newer version updates an existing report.
+- **Replayable Silver.** Silver currently reads the complete append-only Bronze history on every run. Per-table Delta MERGEs are idempotent, but the three-table update is not one transaction.
+- **Recovery after partial writes.** The Silver task retries and replays full Bronze history so child-table synchronization can converge after a partial failure.
+- **Suspect-only drug ranking.** Gold ranks only role 1 (Suspect) drugs; concomitant and interacting drugs are excluded.
 
-> I built a batch data pipeline using openFDA adverse-event reports. Bronze stores the original API responses as append-only JSON, with pagination, retries and secret redaction. Silver uses PySpark to normalize reports, drugs and reactions into separate Delta tables, preserving their grains and avoiding a drug-by-reaction Cartesian join. I added report-version handling, raw-input quality checks and Delta MERGE operations so reruns are repeatable. Gold produces dashboard-ready aggregates, and GitHub Actions runs lint plus local Spark/Delta tests. The main design trade-off is that each Delta table write is atomic, but the three-table Silver update is not a single transaction; the job retries and replays the full Bronze history to converge after a partial failure.
-
-**Design decisions to be ready to explain**
-
-- **Why medallion architecture?** Bronze preserves source evidence; Silver owns cleansing, entity grains and integrity; Gold serves analytics without repeating transformations.
-- **Why separate drug and reaction tables?** Exploding both arrays in one transformation would multiply rows and inflate counts. Separate child tables retain each relationship to the report without implying a drug caused a specific reaction.
-- **How are report updates handled?** Select the highest safetyreportversion; reject conflicting payloads for the same ID/version; update an existing report only when the incoming version is strictly newer.
-- **How do reruns work?** Bronze is append-only. Silver reads the complete Bronze history, deduplicates equivalent records and re-applies idempotent Delta MERGEs. Child-table sync removes rows absent from the latest full-history source.
-- **What is not transactional?** A Delta MERGE is atomic per table, not across reports, drugs and reactions. The Silver task retries and a full-history replay repairs a partial run. This is an explicit recovery strategy, not a claim of cross-table atomicity.
-- **What do the metrics mean?** They count submitted reports, not confirmed adverse effects or causal evidence. FAERS is a spontaneous-reporting system and is subject to reporting bias.
-
-**Known scope and limitations**
+## Limitations
 
 - This is a batch portfolio project, not a production pharmacovigilance system.
-- The current ingestion is deliberately capped at 5,000 records per run; expanding historical coverage and incremental ingestion are future work.
+- Bronze currently ingests a capped 5,000-report sample per run. The scheduled job therefore does not provide incremental historical coverage yet.
+- Silver reprocesses the full Bronze history on every run; incremental ingestion requires a compatible child-table synchronization strategy.
+- Table-level duplicate and orphan gates currently run after the Silver MERGEs. A failure blocks Gold but does not roll back Silver writes.
 - The local Spark/Delta suite validates transformation and MERGE behavior, but it does not prove that the complete pipeline has run successfully in every Databricks workspace configuration.
-- Databricks bundle validation in CI requires workspace credentials; without them that CI job reports a skip.
+- Databricks bundle validation requires workspace credentials; without them the CI job reports a skip.
+
 ## Dashboard
 
 A single-page overview of the adverse event data:
 
 - **KPI counters:** total reports, unique drugs, countries, and reactions
-- **Top 10 drugs by report volume** (LETAIRIS leads with 1,278 reports)
+- **Top 10 suspect drugs by report volume** (LETAIRIS leads with 1,278 reports)
 - **Top 10 countries by reports** (US leads with 3,820)
 - **Top 15 adverse reactions** (most common: Dyspnoea, Type 2 Diabetes Mellitus, Drug Ineffective)
 - **Patient sex distribution** (64% female, 29% male, 7% unknown)
@@ -114,7 +109,7 @@ A single-page overview of the adverse event data:
 
 **Option 1: Run manually.** Clone the repo into a Databricks Git folder and run the notebooks in order: Bronze → Silver → Gold.
 
-**Option 2: Deploy as a job.** The bundle configures daily execution:
+**Option 2: Deploy as a job.** The bundle defines a daily schedule (currently paused by default):
 
 ```bash
 databricks bundle deploy
@@ -125,7 +120,7 @@ databricks bundle deploy
 ```bash
 pip install -r requirements-dev.txt   # pytest, flake8, pyspark, delta-spark
 pytest -v                             # JDK 17 required for the Spark tests
-flake8 notebooks/ tests/               # max-line-length 120, no error codes ignored
+flake8 notebooks/ tests/               # max-line-length 120; ignores E203, W503 and W292
 ```
 
 Tests extract the transformation functions from the notebook sources via AST (so no Databricks session is needed) and run them against a local Spark + Delta session. Coverage includes raw-input rejection before filters, conflicting report-version detection, deterministic drug-role resolution, version-aware MERGE, child-table synchronization, and gold aggregation fan-out safety.
@@ -148,7 +143,10 @@ Tests extract the transformation functions from the notebook sources via AST (so
 - [x] Automated tests for the transform logic (pytest, local Spark + Delta)
 - [x] CI with GitHub Actions (lint, tests, bundle validation)
 - [ ] Orchestrate with Apache Airflow as an alternative to bundles
+- [ ] Add incremental ingestion with a persisted receivedate watermark
+- [ ] Move table-level duplicate/orphan gates before the Silver MERGEs
 - [ ] Expand ingestion beyond the current 5,000-report sample
+- [x] Rank only suspect drugs (role 1) in Gold
 
 ## Author
 
