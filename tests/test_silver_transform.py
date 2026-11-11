@@ -273,3 +273,27 @@ def test_keep_children_of_latest_reports(silver, make_bronze_df, tmp_path):
     assert ("300", "DRUG B") in pairs
     # the version tag is dropped: persisted grain is (report_id, drug_name)
     assert "report_version" not in drugs.columns
+
+def test_validate_silver_batch_passes_clean_grains(silver, spark_session):
+    reports = spark_session.createDataFrame([("R1",), ("R2",)], ["report_id"])
+    drugs = spark_session.createDataFrame([("R1", "DRUG A")], ["report_id", "drug_name"])
+    reactions = spark_session.createDataFrame([("R2", "HEADACHE")], ["report_id", "adverse_reaction"])
+    metrics = silver["validate_silver_batch"](reports, drugs, reactions)
+    assert metrics == {"null_report_ids": 0, "duplicate_report_ids": 0,
+                       "orphan_drugs": 0, "orphan_reactions": 0}
+
+
+def test_validate_silver_batch_rejects_orphan_children_before_merge(silver, spark_session):
+    reports = spark_session.createDataFrame([("R1",)], ["report_id"])
+    drugs = spark_session.createDataFrame([("MISSING", "DRUG A")], ["report_id", "drug_name"])
+    reactions = spark_session.createDataFrame([], ["report_id", "adverse_reaction"])
+    with pytest.raises(RuntimeError, match="BEFORE MERGE"):
+        silver["validate_silver_batch"](reports, drugs, reactions)
+
+
+def test_validate_silver_batch_rejects_duplicate_report_ids(silver, spark_session):
+    reports = spark_session.createDataFrame([("R1",), ("R1",)], ["report_id"])
+    drugs = spark_session.createDataFrame([], ["report_id", "drug_name"])
+    reactions = spark_session.createDataFrame([], ["report_id", "adverse_reaction"])
+    with pytest.raises(RuntimeError, match="duplicate_report_ids"):
+        silver["validate_silver_batch"](reports, drugs, reactions)
