@@ -345,6 +345,30 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
     logger.info(f"MERGE complete: {table_name}")
 
 
+def validate_silver_batch(df_reports: DataFrame, df_drugs: DataFrame,
+                         df_reactions: DataFrame) -> dict:
+    """Run hard grain and referential-integrity checks before any Silver MERGE."""
+    metrics = {
+        "null_report_ids": df_reports.filter(col("report_id").isNull()).count(),
+        "duplicate_report_ids": (
+            df_reports.groupBy("report_id").count().filter(col("count") > 1).count()
+        ),
+        "orphan_drugs": df_drugs.join(
+            df_reports.select("report_id").distinct(), "report_id", "left_anti"
+        ).count(),
+        "orphan_reactions": df_reactions.join(
+            df_reports.select("report_id").distinct(), "report_id", "left_anti"
+        ).count(),
+    }
+    failed = {name: value for name, value in metrics.items() if value > 0}
+    if failed:
+        details = "\\n".join(f"  {name}: {value}" for name, value in failed.items())
+        raise RuntimeError(
+            "SILVER BATCH QUALITY GATE FAILED BEFORE MERGE:\\n"
+            f"{details}\\nNo Silver MERGE was executed."
+        )
+    return metrics
+
 # Validate raw Bronze before any Silver DDL, migration, or MERGE.
 # This must run first: an invalid/empty source must never mutate existing tables.
 raw_df = read_bronze_data(spark, BRONZE_JSON_PATH)
@@ -419,6 +443,9 @@ if __name__ == "__main__":
     logger.info(f"Drugs:     {n_drugs:,}")
     logger.info(f"Reactions: {n_reactions:,}")
 
+    # Validate the complete batch before mutating any Silver table.
+    batch_dq_metrics = validate_silver_batch(df_reports, df_drugs, df_reactions)
+    logger.info(f"Pre-MERGE Silver quality gates passed: {batch_dq_metrics}")
     # MERGE with keys matching each table's grain — idempotent on re-runs
     # fda_reports:          key = report_id; version guard: old never overwrites new
     # fda_report_drugs:     key = (report_id, drug_name); deletes stale child rows
