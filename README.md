@@ -62,7 +62,7 @@ flowchart LR
 - **Idempotent by design.** Each Delta table MERGE is atomic on its own; the three Silver MERGEs are not one cross-table transaction. The Silver task is retried and can be safely replayed from the full Bronze history to converge after a partial failure. Bronze preserves every ingestion run.
 - **Version-aware upserts.** openFDA reports carry `safetyreportversion`; silver keeps only the highest version of each report, and only a strictly newer version can update an existing report; equal versions are immutable, and conflicting same-version payloads fail before any write.
 - **Child-table sync.** When an updated report version drops a drug or reaction, the child MERGE (`whenNotMatchedBySourceDelete`) removes the stale target row. This operation relies on Silver reading the complete append-only Bronze history on every run.
-- **Data quality checks.** Before any Silver write, the pipeline validates raw report IDs and rejects conflicting payloads that share the same report ID/version. Blank drug/reaction terms are counted and warned about before extraction filters them. Table-level grain and referential-integrity gates currently run after the three Silver MERGEs; a failure blocks Gold but does not roll back already-written Silver tables. Moving these gates before the MERGEs is planned work.
+- **Data quality checks.** Raw report IDs and conflicting same-version payloads are validated before Silver writes. The transformed batch is checked for null/duplicate report IDs and orphan drugs/reactions before any MERGE. Persisted-table checks run again after the MERGEs as a second safety net; a post-write failure blocks Gold but does not roll back Silver.
 - **Soft warnings.** Null dates, invalid sex/age values, and blank names are logged as warnings without blocking execution.
 - **Secret hygiene.** openFDA only accepts the API key as a URL query parameter, so `requests` exception messages embed it. Bronze redacts every logged or raised message and never re-raises the original exception (`raise ... from None`).
 - **Resilient ingestion.** HTTP 404 past the first page is treated as a clean end-of-pagination; only transient errors (429, 5xx, network) are retried; permanent 4xx fails fast. Without an API key the pipeline falls back to unauthenticated requests (500 records per page instead of 1,000).
@@ -123,7 +123,7 @@ pytest -v                             # JDK 17 required for the Spark tests
 flake8 notebooks/ tests/               # max-line-length 120; ignores E203, W503 and W292
 ```
 
-Tests extract the transformation functions from the notebook sources via AST (so no Databricks session is needed) and run them against a local Spark + Delta session. Coverage includes raw-input rejection before filters, conflicting report-version detection, deterministic drug-role resolution, version-aware MERGE, child-table synchronization, and gold aggregation fan-out safety.
+Tests extract the transformation functions from the notebook sources via AST (so no Databricks session is needed) and run them against a local Spark + Delta session. Coverage includes raw-input rejection before filters, conflicting report-version detection, deterministic drug-role resolution, pre-MERGE batch integrity gates, version-aware MERGE, child-table synchronization, suspect-only drug ranking, and gold aggregation fan-out safety.
 
 **CI (GitHub Actions)** runs three jobs on every push and pull request: flake8 lint over notebooks and tests, the pytest suite on Ubuntu with Temurin JDK 17, and `databricks bundle validate` (skipped with a notice when workspace credentials are not configured).
 
@@ -144,7 +144,7 @@ Tests extract the transformation functions from the notebook sources via AST (so
 - [x] CI with GitHub Actions (lint, tests, bundle validation)
 - [ ] Orchestrate with Apache Airflow as an alternative to bundles
 - [ ] Add incremental ingestion with a persisted receivedate watermark
-- [ ] Move table-level duplicate/orphan gates before the Silver MERGEs
+- [x] Add pre-MERGE batch gates for duplicate report IDs and orphan children
 - [ ] Expand ingestion beyond the current 5,000-report sample
 - [x] Rank only suspect drugs (role 1) in Gold
 
