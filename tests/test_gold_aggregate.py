@@ -83,6 +83,20 @@ def test_top_drugs_no_fanout_double_count(gold, spark_session):
     assert by_drug["DRUG C"]["report_count"] == 1
 
 
+def test_top_drugs_excludes_non_suspect_roles(gold, spark_session):
+    reports, drugs, _ = _tables(spark_session)
+    # DRUG B is concomitant (role 2); DRUG X is interacting (role 3).
+    extra = spark_session.createDataFrame(
+        [("R2", "DRUG B", 2), ("R4", "DRUG X", 3)],
+        DRUGS_SCHEMA,
+    )
+    rows = gold["build_top_drugs"](drugs.unionByName(extra), reports).collect()
+    names = {row["drug_name"] for row in rows}
+    assert "DRUG B" not in names
+    assert "DRUG X" not in names
+    assert "DRUG A" in names
+
+
 def test_reactions_over_time_counts_unique_reports_per_month(gold, spark_session):
     reports, _, reactions = _tables(spark_session)
     rows = gold["build_reactions_over_time"](reactions, reports).collect()
