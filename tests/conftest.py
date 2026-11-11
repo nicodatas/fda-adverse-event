@@ -261,6 +261,7 @@ SILVER_FUNCTIONS = (
     "extract_reactions",
     "keep_latest_version",
     "keep_children_of_latest_reports",
+    "validate_silver_batch",
     "merge_to_delta",
 )
 
