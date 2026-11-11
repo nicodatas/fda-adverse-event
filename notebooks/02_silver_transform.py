@@ -362,10 +362,10 @@ def validate_silver_batch(df_reports: DataFrame, df_drugs: DataFrame,
     }
     failed = {name: value for name, value in metrics.items() if value > 0}
     if failed:
-        details = "\\n".join(f"  {name}: {value}" for name, value in failed.items())
+        details = "\n".join(f"  {name}: {value}" for name, value in failed.items())
         raise RuntimeError(
-            "SILVER BATCH QUALITY GATE FAILED BEFORE MERGE:\\n"
-            f"{details}\\nNo Silver MERGE was executed."
+            "SILVER BATCH QUALITY GATE FAILED BEFORE MERGE:\n"
+            f"{details}\nNo Silver MERGE was executed."
         )
     return metrics
 
