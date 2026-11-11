@@ -51,14 +51,17 @@ def build_reports_by_country(df_reports: DataFrame) -> DataFrame:
 
 
 def build_top_drugs(df_drugs: DataFrame, df_reports: DataFrame) -> DataFrame:
-    """One row per drug: unique report count and average patient age.
+    """One row per suspect drug: unique report count and average patient age.
 
     The join to fda_reports is on report_id, which is unique in that table, so
     the join does not fan out rows. countDistinct(report_id) guards against
-    double counting if the child grain ever changes.
+    double counting if the child grain ever changes. Only drug_characterization=1 (Suspect)
+    is included; concomitant/interacting drugs are excluded.
     """
+    # Only role 1 (Suspect) is included in the ranking.
+    suspect_drugs = df_drugs.filter(col("drug_characterization") == 1)
     return (
-        df_drugs.join(df_reports, "report_id", "inner")
+        suspect_drugs.join(df_reports, "report_id", "inner")
         .groupBy("drug_name")
         .agg(
             countDistinct("report_id").alias("report_count"),
