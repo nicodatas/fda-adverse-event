@@ -181,8 +181,9 @@ comment_on("TABLE workspace.gold.fda_reports_by_country",
            "Gold layer: number of unique FDA reports grouped by reporter country. "
            "Report frequency does not imply causality or relative drug safety.")
 comment_on("TABLE workspace.gold.fda_top_drugs",
-           "Gold layer: drugs ranked by unique report count with average patient "
-           "age. Report frequency does not imply causality or relative drug safety.")
+           "Gold layer: role 1 (Suspect) drugs ranked by unique report count with average "
+           "patient age. Concomitant/interacting drugs are excluded. Report frequency "
+           "does not imply causality or relative drug safety.")
 comment_on("TABLE workspace.gold.fda_reactions_over_time",
            "Gold layer: number of unique FDA reports per reaction per month. "
            "Excludes reports with an unparseable report_date. Report frequency "
