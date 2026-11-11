@@ -1,0 +1,2 @@
+# Runtime dependencies for the openFDA ingestion notebook.
+requests>=2.31
