@@ -665,8 +665,8 @@ df_reactions.groupBy("adverse_reaction") \
     .show()
 
 # Top drugs — count unique reports per drug, join reports for avg age
-print("\n-- Top 10 drugs by report count (with avg patient age) --")
-df_drugs.join(df_reports, "report_id", "inner") \
+print("\n-- Top 10 suspect drugs by report count (with avg patient age) --")
+df_drugs.filter(col("drug_characterization") == 1).join(df_reports, "report_id", "inner") \
     .groupBy("drug_name") \
     .agg(
         countDistinct("report_id").alias("report_count"),
