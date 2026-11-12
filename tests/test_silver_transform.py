@@ -286,14 +286,32 @@ def test_validate_silver_batch_passes_clean_grains(silver, spark_session):
 def test_validate_silver_batch_rejects_orphan_children_before_merge(silver, spark_session):
     reports = spark_session.createDataFrame([("R1",)], ["report_id"])
     drugs = spark_session.createDataFrame([("MISSING", "DRUG A")], ["report_id", "drug_name"])
-    reactions = spark_session.createDataFrame([], ["report_id", "adverse_reaction"])
+    reactions = spark_session.createDataFrame(
+        [],
+        StructType([
+            StructField("report_id", StringType()),
+            StructField("adverse_reaction", StringType()),
+        ]),
+    )
     with pytest.raises(RuntimeError, match="BEFORE MERGE"):
         silver["validate_silver_batch"](reports, drugs, reactions)
 
 
 def test_validate_silver_batch_rejects_duplicate_report_ids(silver, spark_session):
     reports = spark_session.createDataFrame([("R1",), ("R1",)], ["report_id"])
-    drugs = spark_session.createDataFrame([], ["report_id", "drug_name"])
-    reactions = spark_session.createDataFrame([], ["report_id", "adverse_reaction"])
+    drugs = spark_session.createDataFrame(
+        [],
+        StructType([
+            StructField("report_id", StringType()),
+            StructField("drug_name", StringType()),
+        ]),
+    )
+    reactions = spark_session.createDataFrame(
+        [],
+        StructType([
+            StructField("report_id", StringType()),
+            StructField("adverse_reaction", StringType()),
+        ]),
+    )
     with pytest.raises(RuntimeError, match="duplicate_report_ids"):
         silver["validate_silver_batch"](reports, drugs, reactions)
