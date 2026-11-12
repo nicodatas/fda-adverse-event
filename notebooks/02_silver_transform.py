@@ -345,8 +345,11 @@ def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_c
     logger.info(f"MERGE complete: {table_name}")
 
 
-def validate_silver_batch(df_reports: DataFrame, df_drugs: DataFrame,
-                         df_reactions: DataFrame) -> dict:
+def validate_silver_batch(
+    df_reports: DataFrame,
+    df_drugs: DataFrame,
+    df_reactions: DataFrame,
+) -> dict:
     """Run hard grain and referential-integrity checks before any Silver MERGE."""
     metrics = {
         "null_report_ids": df_reports.filter(col("report_id").isNull()).count(),
@@ -368,6 +371,7 @@ def validate_silver_batch(df_reports: DataFrame, df_drugs: DataFrame,
             f"{details}\nNo Silver MERGE was executed."
         )
     return metrics
+
 
 # Validate raw Bronze before any Silver DDL, migration, or MERGE.
 # This must run first: an invalid/empty source must never mutate existing tables.
