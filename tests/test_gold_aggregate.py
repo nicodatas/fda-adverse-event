@@ -47,7 +47,7 @@ def _tables(spark):
          ("R4", D_JAN2, "US", "FEMALE", "60", "801", 60.0, 0)],
         REPORTS_SCHEMA)
     drugs = spark.createDataFrame(
-        [("R1", "DRUG A", 1), ("R1", "DRUG B", 2),
+        [("R1", "DRUG A", 1), ("R1", "DRUG B", 1),
          ("R2", "DRUG A", 1),
          ("R3", "DRUG C", 1),
          ("R4", "DRUG A", 1)],
@@ -85,14 +85,14 @@ def test_top_drugs_no_fanout_double_count(gold, spark_session):
 
 def test_top_drugs_excludes_non_suspect_roles(gold, spark_session):
     reports, drugs, _ = _tables(spark_session)
-    # DRUG B is concomitant (role 2); DRUG X is interacting (role 3).
+    # DRUG Y is concomitant (role 2); DRUG X is interacting (role 3).
     extra = spark_session.createDataFrame(
-        [("R2", "DRUG B", 2), ("R4", "DRUG X", 3)],
+        [("R2", "DRUG Y", 2), ("R4", "DRUG X", 3)],
         DRUGS_SCHEMA,
     )
     rows = gold["build_top_drugs"](drugs.unionByName(extra), reports).collect()
     names = {row["drug_name"] for row in rows}
-    assert "DRUG B" not in names
+    assert "DRUG Y" not in names
     assert "DRUG X" not in names
     assert "DRUG A" in names
 
