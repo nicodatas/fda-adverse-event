@@ -274,6 +274,7 @@ def test_keep_children_of_latest_reports(silver, make_bronze_df, tmp_path):
     # the version tag is dropped: persisted grain is (report_id, drug_name)
     assert "report_version" not in drugs.columns
 
+
 def test_validate_silver_batch_passes_clean_grains(silver, spark_session):
     reports = spark_session.createDataFrame([("R1",), ("R2",)], ["report_id"])
     drugs = spark_session.createDataFrame([("R1", "DRUG A")], ["report_id", "drug_name"])
