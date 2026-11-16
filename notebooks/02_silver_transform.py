@@ -19,7 +19,8 @@
 # MAGIC then Concomitant (2), then Interacting (3).
 # MAGIC
 # MAGIC **Report versioning:** openFDA reports carry `safetyreportversion`. Identical copies are expected in
-# MAGIC append-only Bronze. Same-version conflicts are checked on fields modeled in Silver; non-modeled openFDA enrichment metadata is excluded.
+# MAGIC append-only Bronze. Same-version conflicts are checked on Silver-modeled fields;
+# MAGIC non-modeled openFDA enrichment metadata is excluded.
 # MAGIC Silver keeps the highest version; only a strictly newer version may update an existing report.
 # MAGIC Child rows (drugs/reactions) are kept only from the latest version of each report, and the child
 # MAGIC MERGE deletes target rows that are no longer present in the source (child-table sync).
