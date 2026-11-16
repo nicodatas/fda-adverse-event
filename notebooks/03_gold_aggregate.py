@@ -101,6 +101,52 @@ def build_reactions_over_time(df_reactions: DataFrame, df_reports: DataFrame) ->
     )
 
 
+def validate_gold_outputs(
+    df_country: DataFrame,
+    df_top_drugs: DataFrame,
+    df_reactions: DataFrame,
+) -> dict:
+    """Fail before writes if a Gold aggregate violates its declared grain.
+
+    Null average ages are valid: they represent reports with no convertible
+    patient age. Key columns and report counts must be populated.
+    """
+    specifications = (
+        ("fda_reports_by_country", df_country, ["country"]),
+        ("fda_top_drugs", df_top_drugs, ["drug_name"]),
+        ("fda_reactions_over_time", df_reactions, ["report_month", "adverse_reaction"]),
+    )
+    metrics = {}
+    failures = {}
+
+    for name, frame, keys in specifications:
+        null_key_condition = None
+        for key in keys:
+            condition = col(key).isNull()
+            null_key_condition = (
+                condition if null_key_condition is None else null_key_condition | condition
+            )
+        null_keys = frame.filter(null_key_condition).count()
+        duplicate_grains = (
+            frame.groupBy(*keys).count().filter(col("count") > 1).count()
+        )
+        invalid_counts = frame.filter(
+            col("report_count").isNull() | (col("report_count") <= 0)
+        ).count()
+        metrics[name] = {
+            "rows": frame.count(),
+            "null_key_rows": null_keys,
+            "duplicate_grains": duplicate_grains,
+            "invalid_report_counts": invalid_counts,
+        }
+        if null_keys or duplicate_grains or invalid_counts:
+            failures[name] = metrics[name]
+
+    if failures:
+        raise RuntimeError(f"GOLD DATA QUALITY GATE FAILED BEFORE WRITE: {failures}")
+    return metrics
+
+
 if __name__ == "__main__":
     # create the gold schema if it doesn't exist
     spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.gold")
@@ -110,15 +156,25 @@ if __name__ == "__main__":
     df_drugs = spark.table("workspace.silver.fda_report_drugs")
     df_reactions = spark.table("workspace.silver.fda_report_reactions")
 
-    build_reports_by_country(df_reports).write.mode("overwrite").format("delta").saveAsTable(
+    # Build and validate all aggregates before mutating any Gold table.
+    gold_country = build_reports_by_country(df_reports)
+    gold_top_drugs = build_top_drugs(df_drugs, df_reports)
+    gold_reactions = build_reactions_over_time(df_reactions, df_reports)
+
+    gold_metrics = validate_gold_outputs(
+        gold_country, gold_top_drugs, gold_reactions
+    )
+    logger.info("Gold pre-write quality gates passed: %s", gold_metrics)
+
+    gold_country.write.mode("overwrite").format("delta").saveAsTable(
         "workspace.gold.fda_reports_by_country"
     )
-    build_top_drugs(df_drugs, df_reports).write.mode("overwrite").format("delta").saveAsTable(
+    gold_top_drugs.write.mode("overwrite").format("delta").saveAsTable(
         "workspace.gold.fda_top_drugs"
     )
-    build_reactions_over_time(df_reactions, df_reports).write.mode("overwrite").format(
-        "delta"
-    ).saveAsTable("workspace.gold.fda_reactions_over_time")
+    gold_reactions.write.mode("overwrite").format("delta").saveAsTable(
+        "workspace.gold.fda_reactions_over_time"
+    )
 
     print("Gold tables created:")
     print("  - workspace.gold.fda_reports_by_country")
