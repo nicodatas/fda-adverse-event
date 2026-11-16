@@ -16,7 +16,7 @@ A batch data pipeline that ingests a capped sample of drug adverse-event reports
 | Metric | Value |
 |---|---|
 | Reports analyzed | 5,000 |
-| Unique drugs | 3,293 |
+| Unique drug names in Silver (all roles) | 3,293 |
 | Countries | 65 |
 | Unique reactions | 2,123 |
 | Period covered | 2008 – 2015 |
@@ -59,14 +59,14 @@ flowchart LR
 
 ## Engineering Highlights
 
-- **Idempotent by design.** Each Delta table MERGE is atomic on its own; the three Silver MERGEs are not one cross-table transaction. The Silver task is retried and can be safely replayed from the full Bronze history to converge after a partial failure. Bronze preserves every ingestion run.
+- **Gold pre-write gates.** All three aggregates are checked for null keys, duplicate grains, and invalid report counts before any Gold table is overwritten. Null average patient ages remain valid unknowns.\n- **Idempotent by design.** Each Delta table MERGE is atomic on its own; the three Silver MERGEs are not one cross-table transaction. The Silver task is retried and can be safely replayed from the full Bronze history to converge after a partial failure. Bronze preserves every ingestion run.
 - **Version-aware upserts.** openFDA reports carry `safetyreportversion`; silver keeps only the highest version of each report, and only a strictly newer version can update an existing report; equal versions are immutable, and conflicting same-version payloads fail before any write.
 - **Child-table sync.** When an updated report version drops a drug or reaction, the child MERGE (`whenNotMatchedBySourceDelete`) removes the stale target row. This operation relies on Silver reading the complete append-only Bronze history on every run.
 - **Data quality checks.** Raw report IDs and conflicting same-version payloads are validated before Silver writes. The transformed batch is checked for null/duplicate report IDs and orphan drugs/reactions before any MERGE. Persisted-table checks run again after the MERGEs as a second safety net; a post-write failure blocks Gold but does not roll back Silver.
 - **Soft warnings.** Null dates, invalid sex/age values, and blank names are logged as warnings without blocking execution.
 - **Secret hygiene.** openFDA only accepts the API key as a URL query parameter, so `requests` exception messages embed it. Bronze redacts every logged or raised message and never re-raises the original exception (`raise ... from None`).
 - **Resilient ingestion.** HTTP 404 past the first page is treated as a clean end-of-pagination; only transient errors (429, 5xx, network) are retried; permanent 4xx fails fast. Without an API key the pipeline falls back to unauthenticated requests (500 records per page instead of 1,000).
-- **Tested.** Pytest covers bronze API error paths and key redaction, silver normalization/version selection/raw quality gates/Delta MERGE semantics, and gold aggregation fan-out safety, including suspect-only drug rankings. CI runs lint and the local Spark/Delta integration suite.
+- **Tested.** Pytest covers bronze API error paths and key redaction, silver normalization/version selection/raw quality gates/Delta MERGE semantics, gold aggregation fan-out safety, suspect-only drug rankings, and pre-write Gold grain validation. CI runs lint and the local Spark/Delta integration suite.
 - **Governed tables.** Unity Catalog provides governance and lineage, with documented Gold tables.
 
 ## Design decisions
@@ -82,7 +82,7 @@ flowchart LR
 - This is a batch portfolio project, not a production pharmacovigilance system.
 - Bronze currently ingests a capped 5,000-report sample per run. The scheduled job therefore does not provide incremental historical coverage yet.
 - Silver reprocesses the full Bronze history on every run; incremental ingestion requires a compatible child-table synchronization strategy.
-- Table-level duplicate and orphan gates currently run after the Silver MERGEs. A failure blocks Gold but does not roll back Silver writes.
+- Silver validates raw input and the complete transformed batch before any MERGE. Persisted-table checks run after the MERGEs as a second safety net; a post-write failure blocks Gold but does not roll back already committed per-table MERGEs.
 - The local Spark/Delta suite validates transformation and MERGE behavior, but it does not prove that the complete pipeline has run successfully in every Databricks workspace configuration.
 - Databricks bundle validation requires workspace credentials; without them the CI job reports a skip.
 
@@ -91,7 +91,7 @@ flowchart LR
 A single-page overview of the adverse event data:
 
 - **KPI counters:** total reports, unique drugs, countries, and reactions
-- **Top 10 suspect drugs by report volume** (LETAIRIS leads with 1,278 reports)
+- **Top 10 suspect drugs by report volume** (LETAIRIS leads with 1,277 reports)
 - **Top 10 countries by reports** (US leads with 3,820)
 - **Top 15 adverse reactions** (most common: Dyspnoea, Type 2 Diabetes Mellitus, Drug Ineffective)
 - **Patient sex distribution** (64% female, 29% male, 7% unknown)
@@ -123,7 +123,7 @@ pytest -v                             # JDK 17 required for the Spark tests
 flake8 notebooks/ tests/               # max-line-length 120; ignores E203, W503 and W292
 ```
 
-Tests extract the transformation functions from the notebook sources via AST (so no Databricks session is needed) and run them against a local Spark + Delta session. Coverage includes raw-input rejection before filters, conflicting report-version detection, deterministic drug-role resolution, pre-MERGE batch integrity gates, version-aware MERGE, child-table synchronization, suspect-only drug ranking, and gold aggregation fan-out safety.
+Tests extract the transformation functions from the notebook sources via AST (so no Databricks session is needed) and run them against a local Spark + Delta session. Coverage includes raw-input rejection before filters, Silver-relevant same-version conflict detection (excluding non-modeled openFDA enrichment metadata), deterministic drug-role resolution, pre-MERGE batch integrity gates, version-aware MERGE, child-table synchronization, suspect-only drug ranking, and gold aggregation fan-out safety.
 
 **CI (GitHub Actions)** runs three jobs on every push and pull request: flake8 lint over notebooks and tests, the pytest suite on Ubuntu with Temurin JDK 17, and `databricks bundle validate` (skipped with a notice when workspace credentials are not configured).
 
