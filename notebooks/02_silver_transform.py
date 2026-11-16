@@ -191,6 +191,7 @@ def validate_raw_input(df: DataFrame) -> dict:
             )
     return metrics
 
+
 def extract_reports(df: DataFrame) -> DataFrame:
     """Extract one row per FDA report with report-level attributes.
 
