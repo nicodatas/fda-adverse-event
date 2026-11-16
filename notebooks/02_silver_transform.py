@@ -19,7 +19,8 @@
 # MAGIC then Concomitant (2), then Interacting (3).
 # MAGIC
 # MAGIC **Report versioning:** openFDA reports carry `safetyreportversion`. Identical copies are expected in
-# MAGIC append-only Bronze, but conflicting payloads with the same report ID/version fail before writes.
+# MAGIC append-only Bronze. Same-version conflicts are checked on Silver-modeled fields;
+# MAGIC non-modeled openFDA enrichment metadata is excluded.
 # MAGIC Silver keeps the highest version; only a strictly newer version may update an existing report.
 # MAGIC Child rows (drugs/reactions) are kept only from the latest version of each report, and the child
 # MAGIC MERGE deletes target rows that are no longer present in the source (child-table sync).
@@ -31,382 +32,632 @@
 # COMMAND ----------
 
 # DBTITLE 1,Silver — Transform & MERGE
+import logging
 
-from pyspark.sql import functions as F
-from pyspark.sql.types import *
-
-# ============================================
-# SILVER - CELL 1
-# Read Bronze and extract FDA reports
-# ============================================
-
-BRONZE_PATH = (
-    "/Volumes/workspace/default/fda_data/bronze/"
-    "ingestion_date=*/run_id=*/page_*.json"
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.functions import (
+    avg,
+    coalesce,
+    col,
+    count,
+    countDistinct,
+    explode,
+    expr,
+    lit,
+    round,
+    row_number,
+    struct,
+    to_date,
+    trim,
+    to_json,
+    upper,
+    when,
 )
+from pyspark.sql.functions import max as _max
+from pyspark.sql.functions import min as _min
+from pyspark.sql.functions import sum as _sum
+from pyspark.sql.window import Window
 
-print("Reading Bronze JSON files...")
+from delta.tables import DeltaTable
 
-# Read original Bronze data
-raw_envelopes = (
-    spark.read
-    .option("multiLine", "true")
-    .json(BRONZE_PATH)
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-# Preserve source lineage
-raw_envelopes = (
-    raw_envelopes
-    .select(
-        "*",
-        F.col("_metadata.file_path").alias("_source_file")
-    )
-    .withColumn(
-        "_run_id",
-        F.regexp_extract(
-            F.col("_source_file"),
-            r"run_id=([^/]+)",
-            1
-        )
-    )
-    .withColumn(
-        "_page",
-        F.regexp_extract(
-            F.col("_source_file"),
-            r"(page_[^/]+\.json)",
-            1
-        )
-    )
-    .withColumn(
-        "_api_last_updated",
-        F.col("meta.last_updated")
-    )
-)
+spark = SparkSession.builder.getOrCreate()
 
-# Extract individual reports from each API response
-df_reports = (
-    raw_envelopes
-    .select(
-        "_source_file",
-        "_run_id",
-        "_page",
-        "_api_last_updated",
-        F.explode_outer("results").alias("report")
-    )
-    .select(
-        "_source_file",
-        "_run_id",
-        "_page",
-        "_api_last_updated",
-        "report.*"
-    )
-)
-
-# Basic ingestion checks (no deduplication)
-print("Bronze envelopes:", raw_envelopes.count())
-print("Extracted reports:", df_reports.count())
-print("Distinct report IDs:", df_reports.select("safetyreportid").distinct().count())
-
-print("Extracted schema:")
-df_reports.printSchema()
-
-display(df_reports.limit(10))
-
-
-# COMMAND ----------
-
-# DBTITLE 1,Silver — Data Quality Validation
-
-from pyspark.sql import functions as F
-
-# ============================================================
-# SILVER - CELL 2
-# Data Quality Validation
-# ============================================================
+# glob pattern picks up all bronze files across every run_id
+BRONZE_JSON_PATH = "/Volumes/workspace/default/fda_data/bronze/ingestion_date=*/run_id=*/page_*.json"
 
 REPORTS_TABLE = "workspace.silver.fda_reports"
 DRUGS_TABLE = "workspace.silver.fda_report_drugs"
 REACTIONS_TABLE = "workspace.silver.fda_report_reactions"
 
-# Read existing Silver tables
-df_reports_silver = spark.table(REPORTS_TABLE)
-df_drugs = spark.table(DRUGS_TABLE)
-df_reactions = spark.table(REACTIONS_TABLE)
 
-# ------------------------------------------------------------
-# 1. Validate required columns
-# ------------------------------------------------------------
+def read_bronze_data(spark_session: SparkSession, path: str) -> DataFrame:
+    logger.info(f"Reading raw JSON data from path: {path}")
+    # multiline=true because openFDA returns pretty-printed JSON, not JSONL
+    return spark_session.read.option("multiline", "true").json(path)
 
-required_columns = {
-    "reports": {
-        "report_id",
-        "report_date",
-        "patient_sex",
-        "patient_age_years"
-    },
-    "drugs": {
-        "report_id",
-        "drug_name"
-    },
-    "reactions": {
-        "report_id",
-        "adverse_reaction"
-    }
-}
 
-dataframes = {
-    "reports": df_reports_silver,
-    "drugs": df_drugs,
-    "reactions": df_reactions
-}
+def validate_raw_input(df: DataFrame) -> dict:
+    """Validate raw input before any Silver DDL or MERGE.
 
-for name, required in required_columns.items():
-    missing = required - set(dataframes[name].columns)
-
-    if missing:
-        raise ValueError(
-            f"{name}: missing required columns: {sorted(missing)}"
+    Repeated Bronze snapshots are expected. Compare only fields consumed by
+    Silver, not the complete API payload: non-modeled openFDA enrichment
+    metadata can vary independently. Child arrays are normalized and sorted
+    so ordering differences do not create false conflicts.
+    """
+    reports = df.select(explode(col("results")).alias("result"))
+    raw_report_count = reports.count()
+    if raw_report_count == 0:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: no raw report records found in Bronze. "
+            "Refusing to run child-table synchronization against an empty source."
         )
 
-# ------------------------------------------------------------
-# 2. Reports quality metrics
-# ------------------------------------------------------------
+    null_report_ids = reports.filter(
+        col("result.safetyreportid").isNull()
+        | (trim(col("result.safetyreportid")) == "")
+    ).count()
 
-reports_metrics = (
-    df_reports_silver
-    .agg(
-        F.count("*").alias("total_rows"),
-        F.sum(
-            F.when(F.col("report_id").isNull(), 1).otherwise(0)
-        ).alias("null_report_ids"),
-        F.sum(
-            F.when(F.col("report_date").isNull(), 1).otherwise(0)
-        ).alias("null_dates"),
-        F.sum(
-            F.when(
-                F.col("patient_sex").isNotNull()
-                & ~F.col("patient_sex").isin(
-                    "MALE", "FEMALE", "UNKNOWN"
-                ),
-                1
-            ).otherwise(0)
+    invalid_versions = reports.filter(
+        col("result.safetyreportversion").isNotNull()
+        & col("result.safetyreportversion").cast("int").isNull()
+    ).count()
+
+    # This projection mirrors the attributes Silver persists. It deliberately
+    # excludes patient.drug.openfda because that enrichment object is not stored
+    # in any Silver table. Differences in modeled fields still fail closed.
+    canonical = reports.select(
+        col("result.safetyreportid").alias("report_id"),
+        coalesce(col("result.safetyreportversion").cast("int"), lit(0)).alias(
+            "report_version"
+        ),
+        to_json(struct(
+            col("result.receiptdate").alias("receiptdate"),
+            col("result.primarysource.reportercountry").alias("reportercountry"),
+            col("result.patient.patientsex").alias("patientsex"),
+            col("result.patient.patientonsetage").alias("patientonsetage"),
+            col("result.patient.patientonsetageunit").alias("patientonsetageunit"),
+            expr(
+                "sort_array(array_distinct(transform("
+                "filter(result.patient.drug, x -> x.medicinalproduct IS NOT NULL "
+                "AND trim(x.medicinalproduct) <> ''), "
+                "x -> named_struct('drug_name', upper(trim(x.medicinalproduct)), "
+                "'drug_role', cast(x.drugcharacterization AS int)))))"
+            ).alias("drugs"),
+            expr(
+                "sort_array(array_distinct(transform("
+                "filter(result.patient.reaction, x -> x.reactionmeddrapt IS NOT NULL "
+                "AND trim(x.reactionmeddrapt) <> ''), "
+                "x -> upper(trim(x.reactionmeddrapt)))))"
+            ).alias("reactions"),
+        )).alias("_silver_payload")
+    ).filter(col("report_id").isNotNull())
+
+    conflicting_versions = (
+        canonical.groupBy("report_id", "report_version")
+        .agg(countDistinct("_silver_payload").alias("payload_versions"))
+        .filter(col("payload_versions") > 1)
+        .count()
+    )
+
+    drug_rows = reports.select(explode(col("result.patient.drug")).alias("drug_info"))
+    blank_drug_names = drug_rows.filter(
+        col("drug_info.medicinalproduct").isNull()
+        | (trim(col("drug_info.medicinalproduct")) == "")
+    ).count()
+
+    reaction_rows = reports.select(
+        explode(col("result.patient.reaction")).alias("reaction_info")
+    )
+    blank_reaction_names = reaction_rows.filter(
+        col("reaction_info.reactionmeddrapt").isNull()
+        | (trim(col("reaction_info.reactionmeddrapt")) == "")
+    ).count()
+
+    metrics = {
+        "null_report_ids": null_report_ids,
+        "invalid_report_versions": invalid_versions,
+        "conflicting_report_versions": conflicting_versions,
+        "blank_drug_names": blank_drug_names,
+        "blank_reaction_names": blank_reaction_names,
+    }
+
+    if null_report_ids:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: "
+            f"{null_report_ids} report record(s) have a null safetyreportid or a blank safetyreportid. "
+            "No Silver tables were written."
+        )
+    if invalid_versions:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: "
+            f"{invalid_versions} report record(s) have a non-integer safetyreportversion. "
+            "No Silver tables were written."
+        )
+    if conflicting_versions:
+        raise RuntimeError(
+            "RAW DATA QUALITY GATE FAILED: "
+            f"{conflicting_versions} report ID/version key(s) have conflicting payloads in Silver-modeled fields. "
+            "Inspect the source before writing Silver."
+        )
+
+    for name in ("blank_drug_names", "blank_reaction_names"):
+        if metrics[name]:
+            logger.warning(
+                f"Raw data-quality warning — {name}: {metrics[name]} "
+                "(these child records will be excluded during extraction)"
+            )
+    return metrics
+
+
+def extract_reports(df: DataFrame) -> DataFrame:
+    """Extract one row per FDA report with report-level attributes.
+
+    Grain: one row per safety report VERSION (safetyreportid + safetyreportversion).
+    report_version defaults to 0 for legacy records that lack the field.
+    Null, empty and whitespace-only reporter countries are mapped to UNKNOWN.
+    Reports without a safetyreportid are dropped here — a report we cannot
+    identify cannot be joined to its drugs and reactions.
+    """
+    logger.info("Extracting report-level records (one row per report)...")
+    df_exploded = df.select(explode(col("results")).alias("result"))
+    country = upper(trim(col("result.primarysource.reportercountry")))
+    return (
+        df_exploded.select(
+            col("result.safetyreportid").alias("report_id"),
+            # openFDA dates come as yyyyMMdd strings, convert to proper DateType
+            to_date(col("result.receiptdate"), "yyyyMMdd").alias("report_date"),
+            # reportercountry is where the report originated — more reliable than occurcountry
+            # null, empty and whitespace-only values are all mapped to UNKNOWN
+            when(country.isNull() | (country == ""), lit("UNKNOWN"))
+            .otherwise(country)
+            .alias("country"),
+            # sex is coded as 1/2 in the raw data, map to readable values
+            when(col("result.patient.patientsex") == "1", "MALE")
+            .when(col("result.patient.patientsex") == "2", "FEMALE")
+            .otherwise("UNKNOWN")
+            .alias("patient_sex"),
+            # preserve raw age and unit — do NOT assume years
+            col("result.patient.patientonsetage").alias("patient_age_raw"),
+            col("result.patient.patientonsetageunit").alias("patient_age_unit"),
+            # version-aware MERGE needs the source version; 0 = legacy record without one
+            coalesce(col("result.safetyreportversion").cast("int"), lit(0)).alias("report_version"),
+        )
+        .filter(col("report_id").isNotNull())
+    )
+
+
+def normalize_age(df: DataFrame) -> DataFrame:
+    """Convert patient_age_raw + patient_age_unit into patient_age_years.
+
+    FAERS patientonsetageunit uses NCIT (NCI Thesaurus) codes:
+      800 = Decade, 801 = Year, 802 = Month, 803 = Week, 804 = Day, 805 = Hour
+
+    Only convert when the unit is one we can safely convert from.
+    Hour (805) is excluded — it only applies to neonates and produces
+    negligible year values not useful for aggregate analytics.
+    """
+    logger.info("Normalizing patient age to years...")
+    age_raw_dbl = col("patient_age_raw").cast("double")
+    return df.withColumn(
+        "patient_age_years",
+        when(col("patient_age_unit") == "800", age_raw_dbl * 10.0)
+        .when(col("patient_age_unit") == "801", age_raw_dbl)
+        .when(col("patient_age_unit") == "802", age_raw_dbl / 12.0)
+        .when(col("patient_age_unit") == "803", age_raw_dbl / 52.0)
+        .when(col("patient_age_unit") == "804", age_raw_dbl / 365.25)
+        .otherwise(None),
+    )
+
+
+def extract_drugs(df: DataFrame) -> DataFrame:
+    """Extract one row per drug within each FDA report.
+
+    Grain: one row per (report_id, report_version, drug_name). If a drug has
+    multiple roles in one report version, retain the highest-priority role
+    deterministically: Suspect (1), then Concomitant (2), then Interacting (3).
+    The version tag is dropped before the MERGE.
+    Rows with a null/blank drug name are dropped — an unnamed drug would
+    violate the persisted table grain (report_id, drug_name).
+    """
+    logger.info("Extracting drug records (one row per drug per report)...")
+    df_exploded = df.select(explode(col("results")).alias("result"))
+    df_drugs = df_exploded.select(
+        col("result.safetyreportid").alias("report_id"),
+        coalesce(col("result.safetyreportversion").cast("int"), lit(0)).alias("report_version"),
+        explode(col("result.patient.drug")).alias("drug_info"),
+    )
+    return (
+        df_drugs.select(
+            col("report_id"),
+            col("report_version"),
+            upper(trim(col("drug_info.medicinalproduct"))).alias("drug_name"),
+            # 1=Suspect, 2=Concomitant, 3=Interacting per openFDA docs
+            col("drug_info.drugcharacterization").cast("int").alias("drug_characterization"),
+        )
+        .filter(
+            col("report_id").isNotNull()
+            & col("drug_name").isNotNull()
+            & (col("drug_name") != "")
+        )
+        .groupBy("report_id", "report_version", "drug_name")
+        .agg(_min("drug_characterization").alias("drug_characterization"))
+    )
+
+
+def extract_reactions(df: DataFrame) -> DataFrame:
+    """Extract one row per adverse reaction within each FDA report.
+
+    Grain: one row per (report_id, report_version, adverse_reaction); the
+    version tag is dropped after filtering to the latest report version.
+    Rows with a null/blank reaction term are dropped.
+    """
+    logger.info("Extracting reaction records (one row per reaction per report)...")
+    df_exploded = df.select(explode(col("results")).alias("result"))
+    df_reactions = df_exploded.select(
+        col("result.safetyreportid").alias("report_id"),
+        coalesce(col("result.safetyreportversion").cast("int"), lit(0)).alias("report_version"),
+        explode(col("result.patient.reaction")).alias("reaction_info"),
+    )
+    return (
+        df_reactions.select(
+            col("report_id"),
+            col("report_version"),
+            upper(trim(col("reaction_info.reactionmeddrapt"))).alias("adverse_reaction"),
+        )
+        .filter(
+            col("report_id").isNotNull()
+            & col("adverse_reaction").isNotNull()
+            & (col("adverse_reaction") != "")
+        )
+    )
+
+
+def keep_latest_version(df: DataFrame, key_cols: list,
+                        version_col: str = "report_version") -> DataFrame:
+    """Keep one row per key: highest version, then latest report_date.
+
+    validate_raw_input rejects conflicting payloads for the same report/version,
+    so remaining ties are identical source copies and row choice is immaterial.
+    """
+    order_cols = [col(version_col).desc()]
+    if "report_date" in df.columns:
+        order_cols.append(col("report_date").desc())
+    window = Window.partitionBy(*key_cols).orderBy(*order_cols)
+    return (
+        df.withColumn("_row_num", row_number().over(window))
+        .filter(col("_row_num") == 1)
+        .drop("_row_num")
+    )
+
+
+def keep_children_of_latest_reports(df_children: DataFrame, df_reports: DataFrame) -> DataFrame:
+    """Keep child rows only from the latest version of each report.
+
+    Without this, drugs/reactions of an older report version would linger
+    after the report was updated. The version tag is dropped here — the
+    persisted child grain is (report_id, drug_name) / (report_id,
+    adverse_reaction).
+    """
+    latest_keys = df_reports.groupBy("report_id").agg(
+        _max("report_version").alias("report_version")
+    )
+    return (
+        df_children.join(latest_keys, ["report_id", "report_version"], "inner")
+        .drop("report_version")
+    )
+
+
+def merge_to_delta(df: DataFrame, table_name: str, merge_condition: str, dedup_cols: list,
+                   version_col: str = None, delete_not_matched_by_source: bool = False) -> None:
+    """Idempotent MERGE — deduplicate source on the merge key, then upsert.
+
+    Source extraction must resolve conflicting non-key attributes before this
+    function. In particular, extract_drugs applies a documented deterministic
+    role priority; dropDuplicates here only collapses otherwise equivalent
+    repeated source rows from append-only Bronze history.
+
+    version_col: when set (reports table), only a strictly newer source version
+    can update the target. Equal versions are immutable; conflicting equal-version
+    payloads are rejected by validate_raw_input before any table is written.
+
+    delete_not_matched_by_source: when True (child tables), target rows absent
+    from the source are deleted — synchronizes child tables when an updated
+    report removes a drug or reaction. Safe ONLY because silver re-reads the
+    complete bronze history every run.
+    """
+    logger.info(f"MERGE into {table_name} (dedup on {dedup_cols})")
+    df = df.dropDuplicates(dedup_cols)
+    delta_table = DeltaTable.forName(spark, table_name)
+    merge_builder = delta_table.alias("target").merge(df.alias("source"), merge_condition)
+    if version_col:
+        merge_builder = merge_builder.whenMatchedUpdateAll(
+            condition=f"source.{version_col} > coalesce(target.{version_col}, 0)"
+        )
+    else:
+        merge_builder = merge_builder.whenMatchedUpdateAll()
+    merge_builder = merge_builder.whenNotMatchedInsertAll()
+    if delete_not_matched_by_source:
+        merge_builder = merge_builder.whenNotMatchedBySourceDelete()
+    merge_builder.execute()
+    logger.info(f"MERGE complete: {table_name}")
+
+
+def validate_silver_batch(
+    df_reports: DataFrame,
+    df_drugs: DataFrame,
+    df_reactions: DataFrame,
+) -> dict:
+    """Run hard grain and referential-integrity checks before any Silver MERGE."""
+    metrics = {
+        "null_report_ids": df_reports.filter(col("report_id").isNull()).count(),
+        "duplicate_report_ids": (
+            df_reports.groupBy("report_id").count().filter(col("count") > 1).count()
+        ),
+        "orphan_drugs": df_drugs.join(
+            df_reports.select("report_id").distinct(), "report_id", "left_anti"
+        ).count(),
+        "orphan_reactions": df_reactions.join(
+            df_reports.select("report_id").distinct(), "report_id", "left_anti"
+        ).count(),
+    }
+    failed = {name: value for name, value in metrics.items() if value > 0}
+    if failed:
+        details = "\n".join(f"  {name}: {value}" for name, value in failed.items())
+        raise RuntimeError(
+            "SILVER BATCH QUALITY GATE FAILED BEFORE MERGE:\n"
+            f"{details}\nNo Silver MERGE was executed."
+        )
+    return metrics
+
+
+# Validate raw Bronze before any Silver DDL, migration, or MERGE.
+# This must run first: an invalid/empty source must never mutate existing tables.
+raw_df = read_bronze_data(spark, BRONZE_JSON_PATH)
+raw_dq_metrics = validate_raw_input(raw_df)
+logger.info(f"Raw input quality metrics: {raw_dq_metrics}")
+
+
+# -- Table DDL ----------------------------------------------------------------
+# No partitioning: the dataset is small (~55K rows). Partitioning by report_date
+# would create many tiny partitions with no meaningful performance benefit.
+# A single unpartitioned Delta table is simpler and performs well at this scale.
+spark.sql("CREATE SCHEMA IF NOT EXISTS workspace.silver")
+
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {REPORTS_TABLE} (
+        report_id STRING,
+        report_date DATE,
+        country STRING,
+        patient_sex STRING,
+        patient_age_raw STRING,
+        patient_age_unit STRING,
+        patient_age_years DOUBLE,
+        report_version INT
+    ) USING DELTA
+""")
+
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {DRUGS_TABLE} (
+        report_id STRING,
+        drug_name STRING,
+        drug_characterization INT
+    ) USING DELTA
+""")
+
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {REACTIONS_TABLE} (
+        report_id STRING,
+        adverse_reaction STRING
+    ) USING DELTA
+""")
+
+# One-time migration for tables created before report versioning was added:
+# backfill existing rows to version 0 so the guarded MERGE treats them as the
+# oldest possible version.
+existing_cols = {row["col_name"] for row in spark.sql(f"DESCRIBE TABLE {REPORTS_TABLE}").collect()}
+if "report_version" not in existing_cols:
+    spark.sql(f"ALTER TABLE {REPORTS_TABLE} ADD COLUMN report_version INT")
+    spark.sql(f"UPDATE {REPORTS_TABLE} SET report_version = 0")
+
+
+if __name__ == "__main__":
+    logger.info("Starting Silver Layer Pipeline Execution...")
+
+    # Extract each entity independently — NO drug x reaction Cartesian product
+    df_reports_all = raw_df.transform(extract_reports).transform(normalize_age)
+    df_drugs_all = raw_df.transform(extract_drugs)
+    df_reactions_all = raw_df.transform(extract_reactions)
+
+    # Collapse to the latest version of each report; keep children only from
+    # that version. Children that exist only in an older version (removed by a
+    # follow-up report) are excluded from the source, and the child MERGE
+    # deletes the stale target rows (delete_not_matched_by_source).
+    df_reports = keep_latest_version(df_reports_all, ["report_id"])
+    df_drugs = keep_children_of_latest_reports(df_drugs_all, df_reports_all)
+    df_reactions = keep_children_of_latest_reports(df_reactions_all, df_reports_all)
+
+    # Log row counts for pipeline observability
+    n_reports = df_reports.count()
+    n_drugs = df_drugs.count()
+    n_reactions = df_reactions.count()
+    logger.info(f"Reports:   {n_reports:,}")
+    logger.info(f"Drugs:     {n_drugs:,}")
+    logger.info(f"Reactions: {n_reactions:,}")
+
+    # Validate the complete batch before mutating any Silver table.
+    batch_dq_metrics = validate_silver_batch(df_reports, df_drugs, df_reactions)
+    logger.info(f"Pre-MERGE Silver quality gates passed: {batch_dq_metrics}")
+    # MERGE with keys matching each table's grain — idempotent on re-runs
+    # fda_reports:          key = report_id; version guard: old never overwrites new
+    # fda_report_drugs:     key = (report_id, drug_name); deletes stale child rows
+    # fda_report_reactions: key = (report_id, adverse_reaction); deletes stale child rows
+    merge_to_delta(df_reports, REPORTS_TABLE,
+                   "target.report_id = source.report_id", ["report_id"],
+                   version_col="report_version")
+    merge_to_delta(df_drugs, DRUGS_TABLE,
+                   "target.report_id = source.report_id AND target.drug_name = source.drug_name",
+                   ["report_id", "drug_name"], delete_not_matched_by_source=True)
+    merge_to_delta(df_reactions, REACTIONS_TABLE,
+                   "target.report_id = source.report_id AND "
+                   "target.adverse_reaction = source.adverse_reaction",
+                   ["report_id", "adverse_reaction"], delete_not_matched_by_source=True)
+
+    logger.info("Silver Pipeline Lifecycle Complete")
+
+# COMMAND ----------
+
+# DBTITLE 1,Silver — Data Quality Validation
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Quality Validation
+# Table-level pass/fail checks at the correct grain for each silver table.
+# These are NOT exploratory statistics — they validate correctness.
+#
+# Hard gates (fail the pipeline): null/duplicate report_id, orphan children.
+# Soft warnings (log only): null dates, invalid sex/age, blank names.
+#
+# The orphan checks compare children against the full reports TABLE (not just
+# the current batch), so they stay correct even if the pipeline later becomes
+# incremental — a child may legitimately reference a report ingested earlier.
+# ─────────────────────────────────────────────────────────────────────────────
+
+df_reports = spark.table("workspace.silver.fda_reports")
+df_drugs = spark.table("workspace.silver.fda_report_drugs")
+df_reactions = spark.table("workspace.silver.fda_report_reactions")
+
+
+def compute_dq_metrics(df_reports: DataFrame, df_drugs: DataFrame,
+                       df_reactions: DataFrame) -> dict:
+    """Compute data-quality metrics for the three silver tables.
+
+    Counts are consolidated into one aggregate per table to avoid a separate
+    Spark action per metric.
+    """
+    reports_row = df_reports.agg(
+        count(lit(1)).alias("rows"),
+        _sum(when(col("report_id").isNull(), 1).otherwise(0)).alias("null_report_ids"),
+        _sum(when(col("report_date").isNull(), 1).otherwise(0)).alias("null_dates"),
+        _sum(
+            when(~col("patient_sex").isin("MALE", "FEMALE", "UNKNOWN"), 1).otherwise(0)
         ).alias("invalid_sex"),
-        F.sum(
-            F.when(
-                F.col("patient_age_years").isNotNull()
-                & (
-                    (F.col("patient_age_years") < 0)
-                    | (F.col("patient_age_years") > 120)
-                ),
-                1
+        _sum(
+            when(
+                col("patient_age_years").isNotNull()
+                & ((col("patient_age_years") < 0) | (col("patient_age_years") > 120)),
+                1,
             ).otherwise(0)
-        ).alias("invalid_age")
+        ).alias("invalid_age"),
+    ).collect()[0]
+
+    duplicate_report_ids = (
+        reports_row["rows"] - df_reports.select("report_id").distinct().count()
     )
-    .first()
-    .asDict()
-)
 
-duplicate_report_ids = (
-    df_reports_silver
-    .groupBy("report_id")
-    .count()
-    .filter(
-        (F.col("report_id").isNotNull())
-        & (F.col("count") > 1)
+    drugs_row = df_drugs.agg(
+        count(lit(1)).alias("rows"),
+        _sum(
+            when(col("drug_name").isNull() | (col("drug_name") == ""), 1).otherwise(0)
+        ).alias("null_drug_names"),
+    ).collect()[0]
+
+    duplicate_drugs = (
+        df_drugs.groupBy("report_id", "drug_name").count().filter(col("count") > 1).count()
     )
-    .count()
-)
 
-# ------------------------------------------------------------
-# 3. Drug quality metrics
-# ------------------------------------------------------------
+    reactions_row = df_reactions.agg(
+        count(lit(1)).alias("rows"),
+        _sum(
+            when(col("adverse_reaction").isNull() | (col("adverse_reaction") == ""),
+                 1).otherwise(0)
+        ).alias("null_reaction_names"),
+    ).collect()[0]
 
-drugs_metrics = (
-    df_drugs
-    .agg(
-        F.count("*").alias("total_rows"),
-        F.sum(
-            F.when(
-                F.col("drug_name").isNull()
-                | (F.trim(F.col("drug_name")) == ""),
-                1
-            ).otherwise(0)
-        ).alias("empty_drug_names")
+    duplicate_reactions = (
+        df_reactions.groupBy("report_id", "adverse_reaction")
+        .count().filter(col("count") > 1).count()
     )
-    .first()
-    .asDict()
-)
 
-# Exact duplicate rows, not repeated drug names.
-# A report can legitimately contain the same drug more than once.
-duplicate_drug_rows = (
-    df_drugs
-    .groupBy(*df_drugs.columns)
-    .count()
-    .filter(F.col("count") > 1)
-    .count()
-)
+    orphan_drugs = df_drugs.join(df_reports, "report_id", "left_anti").count()
+    orphan_reactions = df_reactions.join(df_reports, "report_id", "left_anti").count()
 
-# ------------------------------------------------------------
-# 4. Reaction quality metrics
-# ------------------------------------------------------------
+    return {
+        "total_reports": reports_row["rows"],
+        "null_report_ids": reports_row["null_report_ids"],
+        "duplicate_report_ids": duplicate_report_ids,
+        "null_dates": reports_row["null_dates"],
+        "invalid_sex": reports_row["invalid_sex"],
+        "invalid_age": reports_row["invalid_age"],
+        "total_drugs": drugs_row["rows"],
+        "null_drug_names": drugs_row["null_drug_names"],
+        "duplicate_drugs": duplicate_drugs,
+        "total_reactions": reactions_row["rows"],
+        "null_reaction_names": reactions_row["null_reaction_names"],
+        "duplicate_reactions": duplicate_reactions,
+        "orphan_drugs": orphan_drugs,
+        "orphan_reactions": orphan_reactions,
+    }
 
-reactions_metrics = (
-    df_reactions
-    .agg(
-        F.count("*").alias("total_rows"),
-        F.sum(
-            F.when(
-                F.col("adverse_reaction").isNull()
-                | (F.trim(F.col("adverse_reaction")) == ""),
-                1
-            ).otherwise(0)
-        ).alias("empty_reaction_names")
-    )
-    .first()
-    .asDict()
-)
 
-# Exact duplicate rows, not repeated reaction names.
-duplicate_reaction_rows = (
-    df_reactions
-    .groupBy(*df_reactions.columns)
-    .count()
-    .filter(F.col("count") > 1)
-    .count()
-)
+# Gates that fail the pipeline. Everything else is informational or a soft warning.
+HARD_GATE_CHECKS = ("null_report_ids", "duplicate_report_ids", "orphan_drugs", "orphan_reactions")
 
-# ------------------------------------------------------------
-# 5. Referential integrity
-# ------------------------------------------------------------
 
-orphan_drugs = (
-    df_drugs
-    .filter(F.col("report_id").isNotNull())
-    .join(
-        df_reports_silver.select("report_id").distinct(),
-        on="report_id",
-        how="left_anti"
-    )
-    .count()
-)
+def enforce_hard_gates(metrics: dict, hard_gates: tuple = HARD_GATE_CHECKS) -> None:
+    """Raise RuntimeError when any hard gate is violated.
 
-orphan_reactions = (
-    df_reactions
-    .filter(F.col("report_id").isNotNull())
-    .join(
-        df_reports_silver.select("report_id").distinct(),
-        on="report_id",
-        how="left_anti"
-    )
-    .count()
-)
+    If a gate fails, the silver notebook raises and the downstream gold task
+    is skipped (ALL_SUCCESS dependency in the job).
+    """
+    failed = {name: metrics.get(name, 0) for name in hard_gates if metrics.get(name, 0) > 0}
+    if failed:
+        details = "\n".join(f"  {name}: {value}" for name, value in failed.items())
+        raise RuntimeError(
+            "DATA QUALITY GATE FAILED:\n"
+            f"{details}\n"
+            "Pipeline aborted. Investigate silver table state before re-running."
+        )
 
-# ------------------------------------------------------------
-# 6. Consolidate metrics
-# ------------------------------------------------------------
 
-dq_metrics = {
-    "total_reports": reports_metrics["total_rows"],
-    "null_report_ids": reports_metrics["null_report_ids"] or 0,
-    "duplicate_report_ids": duplicate_report_ids,
-    "null_dates": reports_metrics["null_dates"] or 0,
-    "invalid_sex": reports_metrics["invalid_sex"] or 0,
-    "invalid_age": reports_metrics["invalid_age"] or 0,
+def warn_soft_metrics(metrics: dict) -> None:
+    """Log soft data-quality warnings — suspicious but not pipeline-blocking."""
+    soft_metrics = ("null_dates", "invalid_sex", "invalid_age", "null_drug_names",
+                    "null_reaction_names")
+    for name in soft_metrics:
+        if metrics.get(name, 0) > 0:
+            logger.warning(
+                f"Soft DQ warning — {name}: {metrics[name]} (logged; pipeline continues)"
+            )
 
-    "total_drugs": drugs_metrics["total_rows"],
-    "empty_drug_names": drugs_metrics["empty_drug_names"] or 0,
-    "exact_duplicate_drug_rows": duplicate_drug_rows,
 
-    "total_reactions": reactions_metrics["total_rows"],
-    "empty_reaction_names": reactions_metrics["empty_reaction_names"] or 0,
-    "exact_duplicate_reaction_rows": duplicate_reaction_rows,
-
-    "orphan_drugs": orphan_drugs,
-    "orphan_reactions": orphan_reactions
-}
-
-# ------------------------------------------------------------
-# 7. Print validation report
-# ------------------------------------------------------------
+dq_metrics = compute_dq_metrics(df_reports, df_drugs, df_reactions)
 
 print("=" * 70)
 print("DATA QUALITY VALIDATION")
 print("=" * 70)
-
-print("\n-- fda_reports --")
-print(f"Total rows:                 {dq_metrics['total_reports']:,}")
-print(f"Null report IDs:            {dq_metrics['null_report_ids']}")
-print(f"Duplicate report IDs:       {dq_metrics['duplicate_report_ids']}")
-print(f"Null report dates:          {dq_metrics['null_dates']}")
-print(f"Invalid patient sex:        {dq_metrics['invalid_sex']}")
-print(f"Age out of range:           {dq_metrics['invalid_age']}")
-
-print("\n-- fda_report_drugs --")
-print(f"Total rows:                 {dq_metrics['total_drugs']:,}")
-print(f"Empty drug names:           {dq_metrics['empty_drug_names']}")
-print(f"Exact duplicate rows:       {dq_metrics['exact_duplicate_drug_rows']}")
-
-print("\n-- fda_report_reactions --")
-print(f"Total rows:                 {dq_metrics['total_reactions']:,}")
-print(f"Empty reaction names:       {dq_metrics['empty_reaction_names']}")
-print(f"Exact duplicate rows:       {dq_metrics['exact_duplicate_reaction_rows']}")
-
+print("\n-- workspace.silver.fda_reports --")
+print(f"  Total rows:                      {dq_metrics['total_reports']:,}")
+print(f"  Null report_id:                   {dq_metrics['null_report_ids']}")
+print(f"  Duplicate report_id:              {dq_metrics['duplicate_report_ids']}")
+print(f"  Null report_date:                 {dq_metrics['null_dates']:,}")
+print(f"  Invalid patient_sex:              {dq_metrics['invalid_sex']}")
+print(f"  Age out of range (0-120):         {dq_metrics['invalid_age']}")
+print("\n-- workspace.silver.fda_report_drugs --")
+print(f"  Total rows:                       {dq_metrics['total_drugs']:,}")
+print(f"  Null/empty drug_name:             {dq_metrics['null_drug_names']}")
+print(f"  Duplicate (report_id, drug_name): {dq_metrics['duplicate_drugs']}")
+print("\n-- workspace.silver.fda_report_reactions --")
+print(f"  Total rows:                          {dq_metrics['total_reactions']:,}")
+print(f"  Null/empty adverse_reaction:         {dq_metrics['null_reaction_names']}")
+print(f"  Duplicate (report_id, adverse_reaction): {dq_metrics['duplicate_reactions']}")
 print("\n-- Referential integrity --")
-print(f"Orphan drug records:        {dq_metrics['orphan_drugs']}")
-print(f"Orphan reaction records:    {dq_metrics['orphan_reactions']}")
+print(f"  Drug records with no matching report:      {dq_metrics['orphan_drugs']}")
+print(f"  Reaction records with no matching report:  {dq_metrics['orphan_reactions']}")
 
-# ------------------------------------------------------------
-# 8. Hard quality gates
-# ------------------------------------------------------------
-
-HARD_GATES = [
-    "null_report_ids",
-    "duplicate_report_ids",
-    "orphan_drugs",
-    "orphan_reactions"
-]
-
-failed_gates = {
-    name: dq_metrics[name]
-    for name in HARD_GATES
-    if dq_metrics[name] > 0
-}
-
-if failed_gates:
-    raise RuntimeError(
-        f"DATA QUALITY GATE FAILED: {failed_gates}"
-    )
-
+warn_soft_metrics(dq_metrics)
+enforce_hard_gates(dq_metrics)
 print("\nAll hard quality gates passed.")
-
-# ------------------------------------------------------------
-# 9. Soft warnings
-# ------------------------------------------------------------
-
-SOFT_METRICS = [
-    "null_dates",
-    "invalid_sex",
-    "invalid_age",
-    "empty_drug_names",
-    "empty_reaction_names",
-    "exact_duplicate_drug_rows",
-    "exact_duplicate_reaction_rows"
-]
-
-warnings = {
-    name: dq_metrics[name]
-    for name in SOFT_METRICS
-    if dq_metrics[name] > 0
-}
-
-if warnings:
-    print("\nDATA QUALITY WARNINGS:")
-    for name, value in warnings.items():
-        print(f"WARNING: {name} = {value}")
-else:
-    print("No soft quality warnings.")
-
 
 # COMMAND ----------
 
@@ -468,560 +719,3 @@ df_drugs.filter(col("drug_characterization") == 1).join(df_reports, "report_id",
     .orderBy(col("report_count").desc()) \
     .limit(10) \
     .show(truncate=False)
-
-# COMMAND ----------
-
-
-from pyspark.sql import functions as F
-
-BRONZE_PATH = (
-    "/Volumes/workspace/default/fda_data/bronze/"
-    "ingestion_date=*/run_id=*/page_*.json"
-)
-
-print("=" * 65)
-print("BRONZE vs SILVER — REPORT VERSION AUDIT")
-print("=" * 65)
-
-# 1. Read Bronze and extract only report identifiers and versions
-bronze_raw = (
-    spark.read
-    .option("multiLine", "true")
-    .json(BRONZE_PATH)
-)
-
-bronze_keys = (
-    bronze_raw
-    .select(
-        F.explode_outer("results").alias("report"),
-        F.col("_metadata.file_path").alias("source_file")
-    )
-    .select(
-        F.col("report.safetyreportid").cast("string").alias("report_id"),
-        F.col("report.safetyreportversion").cast("int").alias("report_version"),
-        F.regexp_extract("source_file", r"run_id=([^/]+)", 1).alias("run_id")
-    )
-)
-
-# 2. Read existing Silver reports
-silver_reports = (
-    spark.table("workspace.silver.fda_reports")
-    .select(
-        F.col("report_id").cast("string"),
-        F.col("report_version").cast("int")
-    )
-)
-
-# 3. Basic Bronze metrics
-bronze_valid = bronze_keys.filter(
-    F.col("report_id").isNotNull()
-    & F.col("report_version").isNotNull()
-)
-
-bronze_unique_keys = bronze_valid.select(
-    "report_id", "report_version"
-).distinct()
-
-bronze_multi_version = (
-    bronze_unique_keys
-    .groupBy("report_id")
-    .agg(F.countDistinct("report_version").alias("versions"))
-    .filter(F.col("versions") > 1)
-)
-
-duplicate_bronze_keys = (
-    bronze_valid
-    .groupBy("report_id", "report_version")
-    .count()
-    .filter(F.col("count") > 1)
-)
-
-# 4. Basic Silver metrics
-silver_valid = silver_reports.filter(
-    F.col("report_id").isNotNull()
-    & F.col("report_version").isNotNull()
-)
-
-silver_unique_keys = silver_valid.select(
-    "report_id", "report_version"
-).distinct()
-
-# 5. Compare distinct report/version keys
-silver_keys_missing_in_bronze = (
-    silver_unique_keys.join(
-        bronze_unique_keys,
-        ["report_id", "report_version"],
-        "left_anti"
-    )
-)
-
-bronze_keys_missing_in_silver = (
-    bronze_unique_keys.join(
-        silver_unique_keys,
-        ["report_id", "report_version"],
-        "left_anti"
-    )
-)
-
-# 6. Print results
-print("\n--- BRONZE ---")
-print("Total extracted records:", bronze_keys.count())
-print("Distinct report IDs:", bronze_valid.select("report_id").distinct().count())
-print("Distinct report/version keys:", bronze_unique_keys.count())
-print("Null ID or version records:", bronze_keys.filter(
-    F.col("report_id").isNull() | F.col("report_version").isNull()
-).count())
-print("Keys repeated across Bronze records:", duplicate_bronze_keys.count())
-print("Report IDs with multiple versions:", bronze_multi_version.count())
-print("Distinct ingestion runs:", bronze_keys.select("run_id").distinct().count())
-
-print("\n--- SILVER ---")
-print("Total report rows:", silver_reports.count())
-print("Distinct report IDs:", silver_valid.select("report_id").distinct().count())
-print("Distinct report/version keys:", silver_unique_keys.count())
-
-print("\n--- COMPARISON ---")
-print("Silver keys NOT found in Bronze:", silver_keys_missing_in_bronze.count())
-print("Bronze keys NOT represented in Silver:", bronze_keys_missing_in_silver.count())
-
-print("\n--- SAMPLE: REPORTS WITH MULTIPLE VERSIONS ---")
-bronze_multi_version.orderBy(
-    F.col("versions").desc()
-).show(10, truncate=False)
-
-print("\nAUDIT COMPLETED — NO TABLES WERE MODIFIED")
-
-
-# COMMAND ----------
-
-
-from pyspark.sql import functions as F
-
-print("=" * 65)
-print("BRONZE vs SILVER — DISCREPANCY INVESTIGATION")
-print("=" * 65)
-
-# Rebuild Bronze keys with source information
-bronze_investigation = (
-    bronze_raw
-    .select(
-        F.explode_outer("results").alias("report"),
-        F.col("_metadata.file_path").alias("source_file")
-    )
-    .select(
-        F.col("report.safetyreportid").cast("string").alias("report_id"),
-        F.col("report.safetyreportversion").cast("int").alias("report_version"),
-        F.col("source_file"),
-        F.regexp_extract(
-            "source_file", r"run_id=([^/]+)", 1
-        ).alias("run_id")
-    )
-)
-
-# A. Find the Silver key absent from Bronze
-missing_silver = (
-    silver_unique_keys.join(
-        bronze_unique_keys,
-        ["report_id", "report_version"],
-        "left_anti"
-    )
-)
-
-print("\nA. SILVER KEYS NOT FOUND IN BRONZE")
-missing_silver.show(20, truncate=False)
-
-# B. Inspect Bronze records with missing identifiers or versions
-print("\nB. BRONZE RECORDS WITH NULL ID OR VERSION")
-
-null_records = bronze_investigation.filter(
-    F.col("report_id").isNull()
-    | F.col("report_version").isNull()
-)
-
-print("Total incomplete records:", null_records.count())
-
-null_records.groupBy(
-    "run_id"
-).count().orderBy("run_id").show(50, truncate=False)
-
-print("\nSample incomplete records:")
-null_records.select(
-    "report_id",
-    "report_version",
-    "run_id",
-    "source_file"
-).show(20, truncate=False)
-
-# C. Check how frequently each valid key appears
-print("\nC. BRONZE KEY OCCURRENCE DISTRIBUTION")
-
-key_frequency = (
-    bronze_valid
-    .groupBy("report_id", "report_version")
-    .agg(
-        F.count("*").alias("occurrences"),
-        F.countDistinct("run_id").alias("distinct_runs")
-    )
-)
-
-key_frequency.select(
-    F.min("occurrences").alias("min_occurrences"),
-    F.max("occurrences").alias("max_occurrences"),
-    F.min("distinct_runs").alias("min_runs"),
-    F.max("distinct_runs").alias("max_runs")
-).show()
-
-print("\nD. SAMPLE KEYS WITH THE FEWEST OCCURRENCES")
-key_frequency.orderBy("occurrences").show(10, truncate=False)
-
-print("\nINVESTIGATION COMPLETED — NO TABLES MODIFIED")
-
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F
-
-TARGET_ID = "5801206-7"
-
-BRONZE_PATH = (
-    "/Volumes/workspace/default/fda_data/bronze/"
-    "ingestion_date=*/run_id=*/page_*.json"
-)
-
-# Read original Bronze JSON files
-raw_envelopes = (
-    spark.read
-    .option("multiLine", "true")
-    .json(BRONZE_PATH)
-)
-
-# Extract reports
-df_reports = (
-    raw_envelopes
-    .select(
-        F.explode_outer("results").alias("report"),
-        F.col("_metadata.file_path").alias("_source_file")
-    )
-    .withColumn(
-        "_run_id",
-        F.regexp_extract("_source_file", r"run_id=([^/]+)", 1)
-    )
-    .select(
-        "_run_id",
-        F.col("report.safetyreportid").cast("string").alias("safetyreportid"),
-        F.col("report.safetyreportversion").cast("string").alias("safetyreportversion")
-    )
-)
-
-print("--- BRONZE ---")
-df_reports.filter(
-    F.col("safetyreportid") == TARGET_ID
-).show(50, truncate=False)
-
-print("--- SILVER ---")
-spark.table("workspace.silver.fda_reports") \
-    .filter(F.col("report_id") == TARGET_ID) \
-    .show(truncate=False)
-
-print("INSPECTION COMPLETED — NO TABLES MODIFIED")
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F
-
-tables = [
-    "workspace.silver.fda_reports",
-    "workspace.silver.fda_report_drugs",
-    "workspace.silver.fda_report_reactions"
-]
-
-for table_name in tables:
-    print("\n" + "=" * 70)
-    print(f"DELTA HISTORY: {table_name}")
-    print("=" * 70)
-
-    try:
-        history = spark.sql(
-            f"DESCRIBE HISTORY {table_name}"
-        )
-
-        history.select(
-            "version",
-            "timestamp",
-            "operation",
-            "operationParameters",
-            "userName",
-            "notebook"
-        ).show(10, truncate=False)
-
-    except Exception as e:
-        print(f"Could not retrieve history: {e}")
-
-print("\nHISTORY INSPECTION COMPLETED — NO TABLES MODIFIED")
-
-# COMMAND ----------
-
-history = spark.sql(
-    "DESCRIBE HISTORY workspace.silver.fda_reports"
-)
-
-history.filter(
-    F.upper(F.col("operation")).isin(
-        "MERGE",
-        "WRITE",
-        "CREATE TABLE",
-        "CREATE OR REPLACE TABLE",
-        "UPDATE",
-        "DELETE"
-    )
-).select(
-    "version",
-    "timestamp",
-    "operation",
-    "operationParameters",
-    "operationMetrics",
-    "userName",
-    "notebook"
-).show(50, truncate=False)
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F
-
-TARGET_ID = "5801206-7"
-
-print("=== CURRENT SILVER RECORD ===")
-
-spark.sql("""
-    SELECT report_id, report_version
-    FROM workspace.silver.fda_reports
-    WHERE report_id = '5801206-7'
-""").show(truncate=False)
-
-print("=== REPORT VERSION DISTRIBUTION ===")
-
-spark.table("workspace.silver.fda_reports") \
-    .groupBy("report_version") \
-    .count() \
-    .orderBy("report_version") \
-    .show(truncate=False)
-
-print("=== NULL VERSION CHECK ===")
-
-spark.table("workspace.silver.fda_reports") \
-    .filter(F.col("report_version").isNull()) \
-    .count()
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F
-
-TARGET_ID = "5801206-7"
-
-print("=== CURRENT SILVER RECORD ===")
-
-spark.table("workspace.silver.fda_reports") \
-    .filter(F.col("report_id") == TARGET_ID) \
-    .select("report_id", "report_version") \
-    .show(truncate=False)
-
-print("=== VERSION DISTRIBUTION ===")
-
-spark.table("workspace.silver.fda_reports") \
-    .groupBy("report_version") \
-    .count() \
-    .orderBy("report_version") \
-    .show(truncate=False)
-
-# COMMAND ----------
-
-
-from pyspark.sql import functions as F
-
-# ============================================================
-# BRONZE vs SILVER — VERSION AUDIT
-# Read-only. Rebuilds all DataFrames from scratch.
-# ============================================================
-
-BRONZE_PATH = (
-    "/Volumes/workspace/default/fda_data/bronze/"
-    "ingestion_date=*/run_id=*/page_*.json"
-)
-
-SILVER_TABLE = "workspace.silver.fda_reports"
-TARGET_ID = "10004006"
-
-# 1. Read Bronze from disk
-print("1. READING BRONZE...")
-
-raw_envelopes = (
-    spark.read
-    .option("multiLine", "true")
-    .json(BRONZE_PATH)
-)
-
-# 2. Extract report ID and version, preserving source file
-df_reports = (
-    raw_envelopes
-    .select(
-        F.explode_outer("results").alias("report"),
-        F.col("_metadata.file_path").alias("_source_file")
-    )
-    .withColumn(
-        "_run_id",
-        F.regexp_extract("_source_file", r"run_id=([^/]+)", 1)
-    )
-    .select(
-        "_run_id",
-        F.col("report.safetyreportid").cast("string").alias("report_id"),
-        F.col("report.safetyreportversion").cast("int").alias("bronze_version")
-    )
-)
-
-print("Bronze records:", df_reports.count())
-
-# 3. Inspect the selected report
-print("\n2. TARGET REPORT — BRONZE VERSIONS")
-
-df_reports.filter(
-    F.col("report_id") == TARGET_ID
-).select(
-    "report_id",
-    "bronze_version",
-    "_run_id"
-).distinct().orderBy(
-    "bronze_version"
-).show(100, truncate=False)
-
-# 4. Calculate highest available Bronze version per report
-# NULL is treated as 0, matching the documented legacy convention.
-bronze_latest = (
-    df_reports
-    .groupBy("report_id")
-    .agg(
-        F.coalesce(
-            F.max("bronze_version"),
-            F.lit(0)
-        ).alias("bronze_latest_version")
-    )
-)
-
-# 5. Read Silver directly
-silver = (
-    spark.table(SILVER_TABLE)
-    .select(
-        F.col("report_id"),
-        F.col("report_version").cast("int").alias("silver_version")
-    )
-)
-
-# 6. Compare Bronze latest version against Silver
-comparison = (
-    bronze_latest
-    .join(silver, on="report_id", how="full_outer")
-    .withColumn(
-        "status",
-        F.when(F.col("report_id").isNull(), "MISSING_REPORT_ID")
-         .when(F.col("bronze_latest_version").isNull(), "NOT_IN_BRONZE")
-         .when(F.col("silver_version").isNull(), "NOT_IN_SILVER")
-         .when(
-             F.col("bronze_latest_version") == F.col("silver_version"),
-             "OK"
-         )
-         .otherwise("VERSION_MISMATCH")
-    )
-)
-
-print("\n3. AUDIT SUMMARY")
-
-comparison.groupBy("status").count().show(truncate=False)
-
-print("\n4. VERSION MISMATCHES")
-
-comparison.filter(
-    F.col("status") != "OK"
-).orderBy("report_id").show(100, truncate=False)
-
-print("\n5. TARGET REPORT — BRONZE vs SILVER")
-
-comparison.filter(
-    F.col("report_id") == TARGET_ID
-).show(truncate=False)
-
-print("\nAUDIT COMPLETED — NO TABLES MODIFIED")
-
-
-# COMMAND ----------
-
-
-from pyspark.sql import functions as F
-
-BRONZE_PATH = (
-    "/Volumes/workspace/default/fda_data/bronze/"
-    "ingestion_date=*/run_id=*/page_*.json"
-)
-
-# Rebuild Bronze independently
-raw = (
-    spark.read
-    .option("multiLine", "true")
-    .json(BRONZE_PATH)
-)
-
-bronze = (
-    raw.select(F.explode_outer("results").alias("r"))
-    .select(
-        F.col("r.safetyreportid").cast("string").alias("report_id"),
-        F.col("r.safetyreportversion").cast("int").alias("version")
-    )
-)
-
-# Latest available version per report
-bronze_latest = (
-    bronze.groupBy("report_id")
-    .agg(
-        F.coalesce(F.max("version"), F.lit(0))
-        .alias("bronze_version")
-    )
-)
-
-# Current Silver
-silver = (
-    spark.table("workspace.silver.fda_reports")
-    .select(
-        "report_id",
-        F.col("report_version").cast("int").alias("silver_version")
-    )
-)
-
-# Compare
-audit = bronze_latest.join(
-    silver, "report_id", "full_outer"
-)
-
-audit = audit.withColumn(
-    "status",
-    F.when(F.col("bronze_version").isNull(), "ONLY_IN_SILVER")
-     .when(F.col("silver_version").isNull(), "ONLY_IN_BRONZE")
-     .when(
-         F.col("bronze_version") != F.col("silver_version"),
-         "VERSION_MISMATCH"
-     )
-     .otherwise("OK")
-)
-
-print("=== BRONZE ===")
-print("Total records:", bronze.count())
-print("Distinct report IDs:", bronze.select("report_id").distinct().count())
-
-print("\n=== SILVER ===")
-print("Total rows:", silver.count())
-print("Distinct report IDs:", silver.select("report_id").distinct().count())
-
-print("\n=== AUDIT RESULTS ===")
-audit.groupBy("status").count().show()
-
-print("\n=== PROBLEM EXAMPLES ===")
-audit.filter(F.col("status") != "OK").show(20, truncate=False)
-
-print("\nREAD-ONLY AUDIT COMPLETED")

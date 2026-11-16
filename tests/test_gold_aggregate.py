@@ -3,6 +3,8 @@ and null-date exclusion from the monthly trend.
 """
 import datetime
 
+import pytest
+
 from pyspark.sql.types import (
     DateType,
     DoubleType,
@@ -123,3 +125,34 @@ def test_reactions_over_time_orders_month_desc(gold, spark_session):
     rows = gold["build_reactions_over_time"](reactions, reports).collect()
     first = rows[0]
     assert (first["report_month"], first["adverse_reaction"]) == ("2024-02", "HEADACHE")
+
+
+def test_validate_gold_outputs_allows_unknown_average_age(gold, spark_session):
+    reports, drugs, reactions = _tables(spark_session)
+    country = gold["build_reports_by_country"](reports)
+    top_drugs = gold["build_top_drugs"](drugs, reports)
+    trends = gold["build_reactions_over_time"](reactions, reports)
+
+    metrics = gold["validate_gold_outputs"](country, top_drugs, trends)
+    assert metrics["fda_top_drugs"]["null_key_rows"] == 0
+    assert metrics["fda_top_drugs"]["duplicate_grains"] == 0
+
+
+def test_validate_gold_outputs_rejects_duplicate_grain(gold, spark_session):
+    duplicate_country = spark_session.createDataFrame(
+        [("US", 1), ("US", 2)],
+        ["country", "report_count"],
+    )
+    empty_drugs = spark_session.createDataFrame(
+        [],
+        "drug_name STRING, report_count LONG, avg_patient_age_years DOUBLE",
+    )
+    empty_reactions = spark_session.createDataFrame(
+        [],
+        "report_month STRING, adverse_reaction STRING, report_count LONG",
+    )
+
+    with pytest.raises(RuntimeError, match="GOLD DATA QUALITY GATE FAILED"):
+        gold["validate_gold_outputs"](
+            duplicate_country, empty_drugs, empty_reactions
+        )

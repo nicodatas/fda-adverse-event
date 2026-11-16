@@ -133,6 +133,46 @@ def test_raw_validation_counts_blank_children_before_extraction(silver, make_bro
     assert metrics["blank_reaction_names"] == 2
 
 
+def test_raw_validation_ignores_openfda_enrichment_only_differences(
+    silver, make_bronze_df, tmp_path
+):
+    raw = make_bronze_df([
+        {
+            "safetyreportid": "R1",
+            "safetyreportversion": "2",
+            "receiptdate": "20240115",
+            "primarysource": {"reportercountry": "US"},
+            "patient": {
+                "patientsex": "1",
+                "drug": [{
+                    "medicinalproduct": "DRUG A",
+                    "drugcharacterization": "1",
+                    "openfda": {"product_ndc": "00001-0001"},
+                }],
+                "reaction": [{"reactionmeddrapt": "HEADACHE"}],
+            },
+        },
+        {
+            "safetyreportid": "R1",
+            "safetyreportversion": "2",
+            "receiptdate": "20240115",
+            "primarysource": {"reportercountry": "US"},
+            "patient": {
+                "patientsex": "1",
+                "drug": [{
+                    "medicinalproduct": "DRUG A",
+                    "drugcharacterization": "1",
+                    "openfda": {"product_ndc": "00002-0002"},
+                }],
+                "reaction": [{"reactionmeddrapt": "HEADACHE"}],
+            },
+        },
+    ], tmp_path)
+
+    metrics = silver["validate_raw_input"](raw)
+    assert metrics["conflicting_report_versions"] == 0
+
+
 def test_drug_role_conflict_uses_documented_priority(silver, make_bronze_df, tmp_path):
     raw = make_bronze_df([{
         "safetyreportid": "R1",
