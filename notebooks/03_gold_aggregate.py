@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Gold Layer Title
 # MAGIC %md
 # MAGIC # Gold Layer — Aggregated Tables & Governance

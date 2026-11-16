@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Bronze Layer Title
 # MAGIC %md
 # MAGIC # Bronze Layer — Raw Ingestion from openFDA
