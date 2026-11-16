@@ -80,9 +80,11 @@ def _base_namespace():
             countDistinct,
             date_format,
             explode,
+            expr,
             lit,
             round,
             row_number,
+            struct,
             to_date,
             to_json,
             trim,
@@ -104,9 +106,11 @@ def _base_namespace():
             "countDistinct": countDistinct,
             "date_format": date_format,
             "explode": explode,
+            "expr": expr,
             "lit": lit,
             "round": round,
             "row_number": row_number,
+            "struct": struct,
             "to_date": to_date,
             "to_json": to_json,
             "trim": trim,
@@ -192,6 +196,9 @@ def make_bronze_df(spark_session):
                     StructField("drug", ArrayType(StructType([
                         StructField("medicinalproduct", StringType()),
                         StructField("drugcharacterization", StringType()),
+                        StructField("openfda", StructType([
+                            StructField("product_ndc", StringType()),
+                        ])),
                     ]))),
                     StructField("reaction", ArrayType(StructType([
                         StructField("reactionmeddrapt", StringType()),
