@@ -127,7 +127,6 @@ def test_reactions_over_time_orders_month_desc(gold, spark_session):
     assert (first["report_month"], first["adverse_reaction"]) == ("2024-02", "HEADACHE")
 
 
-
 def test_validate_gold_outputs_allows_unknown_average_age(gold, spark_session):
     reports, drugs, reactions = _tables(spark_session)
     country = gold["build_reports_by_country"](reports)
