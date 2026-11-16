@@ -300,6 +300,7 @@ GOLD_FUNCTIONS = (
     "build_reports_by_country",
     "build_top_drugs",
     "build_reactions_over_time",
+    "validate_gold_outputs",
 )
 
 
