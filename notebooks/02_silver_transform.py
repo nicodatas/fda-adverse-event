@@ -166,7 +166,7 @@ def validate_raw_input(df: DataFrame) -> dict:
     if null_report_ids:
         raise RuntimeError(
             "RAW DATA QUALITY GATE FAILED: "
-            f"{null_report_ids} report record(s) have a null or blank safetyreportid. "
+            f"{null_report_ids} report record(s) have a null safetyreportid or a blank safetyreportid. "
             "No Silver tables were written."
         )
     if invalid_versions:
@@ -178,8 +178,8 @@ def validate_raw_input(df: DataFrame) -> dict:
     if conflicting_versions:
         raise RuntimeError(
             "RAW DATA QUALITY GATE FAILED: "
-            f"{conflicting_versions} report ID/version key(s) have conflicting "
-            "Silver-relevant payloads. Inspect the source before writing Silver."
+            f"{conflicting_versions} report ID/version key(s) have conflicting payloads in Silver-modeled fields. "
+            "Inspect the source before writing Silver."
         )
 
     for name in ("blank_drug_names", "blank_reaction_names"):
