@@ -17,6 +17,7 @@ A batch data pipeline that ingests a capped sample of drug adverse-event reports
 |---|---|
 | Reports analyzed | 5,000 |
 | Unique drug names in Silver (all roles) | 3,293 |
+| Suspect drug names in Gold | 1,458 |
 | Countries | 65 |
 | Unique reactions | 2,123 |
 | Period covered | 2008 – 2015 |
@@ -59,7 +60,8 @@ flowchart LR
 
 ## Engineering Highlights
 
-- **Gold pre-write gates.** All three aggregates are checked for null keys, duplicate grains, and invalid report counts before any Gold table is overwritten. Null average patient ages remain valid unknowns.\n- **Idempotent by design.** Each Delta table MERGE is atomic on its own; the three Silver MERGEs are not one cross-table transaction. The Silver task is retried and can be safely replayed from the full Bronze history to converge after a partial failure. Bronze preserves every ingestion run.
+- **Gold pre-write gates.** All three aggregates are checked for null keys, duplicate grains, and invalid report counts before any Gold table is overwritten. Null average patient ages remain valid unknowns.
+- **Idempotent by design.** Each Delta table MERGE is atomic on its own; the three Silver MERGEs are not one cross-table transaction. The Silver task is retried and can be safely replayed from the full Bronze history to converge after a partial failure. Bronze preserves every ingestion run.
 - **Version-aware upserts.** openFDA reports carry `safetyreportversion`; silver keeps only the highest version of each report, and only a strictly newer version can update an existing report; equal versions are immutable, and conflicting same-version payloads fail before any write.
 - **Child-table sync.** When an updated report version drops a drug or reaction, the child MERGE (`whenNotMatchedBySourceDelete`) removes the stale target row. This operation relies on Silver reading the complete append-only Bronze history on every run.
 - **Data quality checks.** Raw report IDs and conflicting same-version payloads are validated before Silver writes. The transformed batch is checked for null/duplicate report IDs and orphan drugs/reactions before any MERGE. Persisted-table checks run again after the MERGEs as a second safety net; a post-write failure blocks Gold but does not roll back Silver.
