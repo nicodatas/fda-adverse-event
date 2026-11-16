@@ -133,7 +133,6 @@ def test_raw_validation_counts_blank_children_before_extraction(silver, make_bro
     assert metrics["blank_reaction_names"] == 2
 
 
-
 def test_raw_validation_ignores_openfda_enrichment_only_differences(
     silver, make_bronze_df, tmp_path
 ):
@@ -172,6 +171,7 @@ def test_raw_validation_ignores_openfda_enrichment_only_differences(
 
     metrics = silver["validate_raw_input"](raw)
     assert metrics["conflicting_report_versions"] == 0
+
 
 def test_drug_role_conflict_uses_documented_priority(silver, make_bronze_df, tmp_path):
     raw = make_bronze_df([{
